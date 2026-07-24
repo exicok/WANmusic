@@ -7,6 +7,22 @@
     <color name="teal_200">#FF03DAC5</color>
     <color name="teal_700">#FF018786</color>
     <color name="white">#FFFFFFFF</color>
-    <string name="app_name">music</string>
+    <string name="app_name">wanmusic</string>
+    <string name="overlay_action_close">关闭</string>
+    <string name="overlay_channel_desc">悬浮歌词服务通知</string>
+    <string name="overlay_channel_name">悬浮歌词</string>
+    <string name="overlay_idle_lyric">等待播放…</string>
+    <string name="overlay_idle_title">wanmusic</string>
+    <string name="overlay_notification_text">正在显示悬浮歌词，可拖动位置</string>
+    <string name="overlay_notification_title">悬浮歌词</string>
+    <string name="widget_artwork">专辑封面</string>
+    <string name="widget_idle_lyric">暂无播放</string>
+    <string name="widget_idle_title">wanmusic</string>
+    <string name="widget_lyrics_description">显示专辑封面、当前歌曲与实时歌词，支持播放控制</string>
+    <string name="widget_lyrics_name">桌面歌词</string>
+    <string name="widget_next">下一曲</string>
+    <string name="widget_no_lyric">暂无歌词</string>
+    <string name="widget_play">播放/暂停</string>
+    <string name="widget_prev">上一曲</string>
     <style name="Theme.Music" parent="android:Theme.Material.Light.NoActionBar"/>
 </resources>

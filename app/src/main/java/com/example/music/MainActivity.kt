@@ -8,6 +8,7 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.MediaCodecList
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
@@ -26,6 +27,9 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -37,6 +41,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.History
@@ -67,6 +72,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.buildAnnotatedString
@@ -74,6 +81,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
@@ -101,6 +109,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.debounce
 
 // Config Persistence Helper
 object ConfigManager {
@@ -120,6 +131,25 @@ object ConfigManager {
 
 // 扫描记录持久化：保存上次扫描的歌曲列表（封面保存为独立 PNG 文件），
 // 应用启动时直接加载，避免每次启动都重新扫描音乐库目录
+// 歌曲列表滚动位置记忆：回到音乐页时恢复上次滑动位置
+object ListScrollMemory {
+    private const val PREFS = "music_prefs"
+    private const val KEY_INDEX = "local_list_index"
+    private const val KEY_OFFSET = "local_list_offset"
+
+    fun load(context: android.content.Context): Pair<Int, Int> {
+        val p = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+        return p.getInt(KEY_INDEX, 0) to p.getInt(KEY_OFFSET, 0)
+    }
+
+    fun save(context: android.content.Context, index: Int, offset: Int) {
+        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit {
+            putInt(KEY_INDEX, index.coerceAtLeast(0))
+            putInt(KEY_OFFSET, offset.coerceAtLeast(0))
+        }
+    }
+}
+
 object ScanRecordsManager {
     private const val FILE_NAME = "scan_records.json"
     private const val ARTWORK_DIR = "artwork"
@@ -196,11 +226,7 @@ object ScanRecordsManager {
     /** 异步加载封面：扫描单张 Bitmap 并赋值给 Song，返回更新后的 Song */
     fun loadArtworkAsync(context: android.content.Context, song: Song): Song? {
         if (song.artwork != null) return song
-        val artworkDir = File(context.filesDir, ARTWORK_DIR)
-        if (!artworkDir.exists()) return null
-        // 用 URI 哈希找封面文件
-        val hash = song.uri.toString().hashCode().toString(16)
-        val artFile = File(artworkDir, "$hash.png")
+        val artFile = artworkFile(context, song.uri)
         if (!artFile.exists()) return null
         return try {
             val bitmap = android.graphics.BitmapFactory.decodeFile(artFile.absolutePath)
@@ -208,6 +234,60 @@ object ScanRecordsManager {
         } catch (e: Exception) {
             null
         }
+    }
+
+    fun artworkFile(context: android.content.Context, uri: Uri): File {
+        val hash = uri.toString().hashCode().toString(16)
+        return File(File(context.filesDir, ARTWORK_DIR), "$hash.png")
+    }
+
+    /** 确保封面落盘，便于桌面部件读取。 */
+    fun ensureArtworkCached(context: android.content.Context, song: Song?) {
+        if (song == null) return
+        val file = artworkFile(context, song.uri)
+        if (file.exists()) return
+        val bitmap = song.artwork ?: return
+        runCatching {
+            file.parentFile?.mkdirs()
+            file.outputStream().use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+            }
+        }
+    }
+
+    /** 读取封面 Bitmap，可选缩放到 maxPx，优先缓存文件，其次内存 bitmap。 */
+    fun loadArtworkBitmap(
+        context: android.content.Context,
+        song: Song,
+        maxPx: Int = 256
+    ): Bitmap? {
+        ensureArtworkCached(context, song)
+        val file = artworkFile(context, song.uri)
+        val raw = when {
+            file.exists() -> runCatching {
+                decodeSampledBitmap(file.absolutePath, maxPx)
+            }.getOrNull()
+            song.artwork != null -> song.artwork
+            else -> null
+        } ?: return null
+        return if (raw.width <= maxPx && raw.height <= maxPx) {
+            raw
+        } else {
+            val scale = maxPx.toFloat() / maxOf(raw.width, raw.height).toFloat()
+            val w = (raw.width * scale).toInt().coerceAtLeast(1)
+            val h = (raw.height * scale).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(raw, w, h, true)
+        }
+    }
+
+    private fun decodeSampledBitmap(path: String, maxPx: Int): Bitmap? {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(path, bounds)
+        var sample = 1
+        val largest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
+        while (largest / sample > maxPx * 2) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        return android.graphics.BitmapFactory.decodeFile(path, opts)
     }
 
     // 清理：删除所有已保存的扫描记录和封面文件
@@ -487,6 +567,7 @@ sealed class Screen {
     object WebDav : Screen()
     object Data : Screen()
     object Playback : Screen()
+    object AudioCodecs : Screen()
     object Equalizer : Screen()
     object LocalMusic : Screen()
     object PlayerView : Screen()
@@ -566,7 +647,7 @@ fun MusicApp(
             WindowCompat.getInsetsController(window, window.decorView).apply {
                 if (currentScreen == Screen.PlayerView) {
                     systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    hide(WindowInsetsCompat.Type.systemBars())
+                    hide(WindowInsetsCompat.Type.statusBars())
                 } else {
                     show(WindowInsetsCompat.Type.systemBars())
                 }
@@ -714,6 +795,47 @@ fun MusicApp(
         lyriconProvider?.player?.setPosition(currentPosition.coerceAtLeast(0L))
     }
 
+    // 同步给桌面歌词部件与悬浮歌词
+    LaunchedEffect(currentSong, currentSongLyrics, currentPosition, totalDuration, isPlaying) {
+        LyricsStateHolder.publish(
+            context = context,
+            song = currentSong,
+            lyrics = currentSongLyrics,
+            position = currentPosition,
+            duration = totalDuration,
+            playing = isPlaying
+        )
+    }
+
+    // 当前曲目变化时缓存封面并刷新桌面部件专辑图
+    LaunchedEffect(currentSong?.uri) {
+        val song = currentSong ?: return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            val withArt = if (song.artwork == null) {
+                ScanRecordsManager.loadArtworkAsync(context, song) ?: song
+            } else {
+                song
+            }
+            ScanRecordsManager.ensureArtworkCached(context, withArt)
+        }
+        LyricsWidgetProvider.updateAllWidgets(context)
+    }
+
+    // 若用户此前开启了悬浮歌词，回到前台时自动恢复
+    val hostActivity = context as? ComponentActivity
+    DisposableEffect(hostActivity) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                OverlayLyricsService.startIfEnabled(context)
+            }
+        }
+        hostActivity?.lifecycle?.addObserver(observer)
+        onDispose { hostActivity?.lifecycle?.removeObserver(observer) }
+    }
+    LaunchedEffect(Unit) {
+        OverlayLyricsService.startIfEnabled(context)
+    }
+
     LaunchedEffect(isPlaying, currentSong) {
         if (isPlaying) {
             while (true) {
@@ -763,7 +885,7 @@ fun MusicApp(
     // 提取统一的返回逻辑
     val handleBack = {
         currentScreen = when (currentScreen) {
-            Screen.Library, Screen.Data, Screen.Playback -> Screen.Settings
+            Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs -> Screen.Settings
             Screen.Equalizer -> Screen.LocalMusic
             Screen.WebDav -> Screen.Settings
             Screen.LocalMusic -> Screen.LocalMusic
@@ -800,6 +922,13 @@ fun MusicApp(
     Box(modifier = Modifier.fillMaxSize()) {
         val dockScreens = setOf(Screen.LocalMusic, Screen.Equalizer, Screen.Settings)
         val showDock = currentScreen in dockScreens
+        val isFloatDock = dockPosition.equals("float", ignoreCase = true)
+        // 悬浮层仅用于音乐列表，避免遮挡设置/均衡器等其它页面
+        val floatOverlayActive = isFloatDock && currentScreen == Screen.LocalMusic
+        val showFixedBottomBar = showDock && (
+            dockPosition == "bottom" ||
+                (isFloatDock && currentScreen != Screen.LocalMusic)
+        )
         Scaffold(
             containerColor = if (currentScreen == Screen.PlayerView) Color.Transparent
                 else MaterialTheme.colorScheme.background,
@@ -821,7 +950,8 @@ fun MusicApp(
                 }
             },
             bottomBar = {
-                if (showDock && dockPosition != "top") {
+                // 底部固定栏；悬浮偏好下除音乐列表外也走固定栏，避免干扰其它页面
+                if (showFixedBottomBar) {
                     Column {
                         if (currentSong != null) {
                         MD3MiniPlayer(
@@ -844,7 +974,10 @@ fun MusicApp(
             }
         ) { innerPadding ->
             Box(
-                modifier = Modifier.padding(innerPadding)
+                modifier = Modifier.padding(
+                    // 仅音乐列表悬浮层时内容铺满；其它页面使用 Scaffold 正常 padding
+                    if (floatOverlayActive) PaddingValues(0.dp) else innerPadding
+                )
             ) {
                 AnimatedContent(
                     targetState = currentScreen,
@@ -918,6 +1051,12 @@ fun MusicApp(
                         Screen.LocalMusic -> LocalMusicScreen(
                             songs = songs,
                             isScanning = isScanning,
+                            bottomContentPadding = if (floatOverlayActive) {
+                                // 仅音乐列表悬浮层预留底部，避免最后几首被挡住
+                                if (currentSong != null) 156.dp else 90.dp
+                            } else {
+                                0.dp
+                            },
                             onSongClick = { song ->
                                 currentSong = song
                                 try {
@@ -937,7 +1076,10 @@ fun MusicApp(
                                 } catch (e: Throwable) {
                                     android.util.Log.e("MusicApp", "播放启动失败", e)
                                 }
-                                openPlayer()
+                                val openOnClick = context
+                                    .getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
+                                    .getBoolean("open_player_on_song_click", false)
+                                if (openOnClick) openPlayer()
                             },
                             onReorder = { from, to ->
                                 val newList = songs.toMutableList()
@@ -986,10 +1128,60 @@ fun MusicApp(
                             onDjModeChange = onDjModeChange,
                             onBack = { currentScreen = Screen.Settings }
                         )
+                        Screen.AudioCodecs -> AudioCodecSupportScreen(
+                            onBack = { currentScreen = Screen.Settings }
+                        )
                         Screen.Equalizer -> EqualizerSettingsScreen(
                             onBack = { currentScreen = Screen.LocalMusic }
                         )
                     }
+                }
+            }
+        }
+
+        // 悬浮底部 Dock：真正浮在内容之上（圆角卡片 + 边距 + 半透明）
+        if (floatOverlayActive) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .zIndex(10f)
+                    .navigationBarsPadding()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (currentSong != null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        tonalElevation = 4.dp,
+                        shadowElevation = 10.dp,
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f)
+                    ) {
+                        MD3MiniPlayer(
+                            song = currentSong!!,
+                            isPlaying = isPlaying,
+                            progress = if (totalDuration > 0) currentPosition.toFloat() / totalDuration else 0f,
+                            onTogglePlay = { if (player.isPlaying) player.pause() else player.play() },
+                            onClick = openPlayer,
+                            onNext = { player.seekToNext() },
+                            onPrevious = { player.seekToPrevious() },
+                            onSeek = { player.seekTo((it * totalDuration).toLong()) }
+                        )
+                    }
+                }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(28.dp),
+                    tonalElevation = 6.dp,
+                    shadowElevation = 14.dp,
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f)
+                ) {
+                    MusicDock(
+                        currentScreen = currentScreen,
+                        onNavigate = { currentScreen = it },
+                        floating = true
+                    )
                 }
             }
         }
@@ -1011,13 +1203,41 @@ fun LocalMusicScreen(
     songs: List<Song>,
     isScanning: Boolean,
     onSongClick: (Song) -> Unit,
-    onReorder: (Int, Int) -> Unit
+    onReorder: (Int, Int) -> Unit,
+    bottomContentPadding: androidx.compose.ui.unit.Dp = 0.dp
 ) {
     val context = LocalContext.current
-    val listState = rememberLazyListState()
+    val savedScroll = remember { ListScrollMemory.load(context) }
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = savedScroll.first,
+        initialFirstVisibleItemScrollOffset = savedScroll.second
+    )
     var draggingItemIndex by remember { mutableStateOf<Int?>(null) }
     var dragOffset by remember { mutableFloatStateOf(0f) }
     var detailSong by remember { mutableStateOf<Song?>(null) }
+
+    // 记录滑动位置，返回音乐页时恢复
+    LaunchedEffect(listState, songs.size) {
+        snapshotFlow {
+            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+        }
+            .distinctUntilChanged()
+            .debounce(250)
+            .collectLatest { (index, offset) ->
+                if (songs.isNotEmpty()) {
+                    ListScrollMemory.save(context, index, offset)
+                }
+            }
+    }
+
+    // 列表变短时，避免恢复到越界位置
+    LaunchedEffect(songs.size) {
+        if (songs.isEmpty()) return@LaunchedEffect
+        val maxIndex = songs.lastIndex
+        if (listState.firstVisibleItemIndex > maxIndex) {
+            listState.scrollToItem(maxIndex)
+        }
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -1037,7 +1257,8 @@ fun LocalMusicScreen(
             } else {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = bottomContentPadding)
                 ) {
                     itemsIndexed(songs, key = { _, song -> song.uri.toString() }) { index, song ->
                         val artwork = rememberArtwork(song)
@@ -1144,23 +1365,38 @@ fun SettingsMenu(
         Column(Modifier.padding(padding).verticalScroll(rememberScrollState())) {
             ListItem(
                 headlineContent = { Text("Dock 位置") },
-                supportingContent = { Text(if (dockPosition == "top") "顶部 Dock" else "底部 Dock") },
-                leadingContent = { Icon(Icons.Default.Dock, null) },
-                trailingContent = {
-                    SingleChoiceSegmentedButtonRow {
-                        SegmentedButton(
-                            selected = dockPosition == "top",
-                            onClick = { onDockPositionChange("top") },
-                            shape = SegmentedButtonDefaults.itemShape(0, 2)
-                        ) { Text("顶部") }
-                        SegmentedButton(
-                            selected = dockPosition != "top",
-                            onClick = { onDockPositionChange("bottom") },
-                            shape = SegmentedButtonDefaults.itemShape(1, 2)
-                        ) { Text("底部") }
-                    }
-                }
+                supportingContent = {
+                    Text(
+                        when (dockPosition) {
+                            "top" -> "顶部 Dock"
+                            "float" -> "仅音乐列表悬浮；设置/均衡器等页面仍用固定底栏，不遮挡内容"
+                            else -> "底部 Dock"
+                        }
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.Dock, null) }
             )
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                SegmentedButton(
+                    selected = dockPosition == "top",
+                    onClick = { onDockPositionChange("top") },
+                    shape = SegmentedButtonDefaults.itemShape(0, 3)
+                ) { Text("顶部") }
+                SegmentedButton(
+                    selected = dockPosition == "bottom",
+                    onClick = { onDockPositionChange("bottom") },
+                    shape = SegmentedButtonDefaults.itemShape(1, 3)
+                ) { Text("底部") }
+                SegmentedButton(
+                    selected = dockPosition == "float",
+                    onClick = { onDockPositionChange("float") },
+                    shape = SegmentedButtonDefaults.itemShape(2, 3)
+                ) { Text("悬浮") }
+            }
             HorizontalDivider()
             ListItem(
                 headlineContent = { Text("播放页方向") },
@@ -1189,10 +1425,13 @@ fun SettingsMenu(
                 modifier = Modifier.clickable { onAmoledModeChange(!isAmoledMode) }
             )
             HorizontalDivider()
-            
+            SettingsSectionHeader("界面与播放")
             SettingsItem("播放设置", Icons.Default.GraphicEq) { onNavigate(Screen.Playback) }
+            SettingsItem("音频解码支持", Icons.Default.AudioFile) { onNavigate(Screen.AudioCodecs) }
+            SettingsSectionHeader("音乐来源")
             SettingsItem("音乐库", Icons.Default.LibraryMusic) { onNavigate(Screen.Library) }
             SettingsItem("WebDAV 音乐源", Icons.Default.CloudQueue) { onNavigate(Screen.WebDav) }
+            SettingsSectionHeader("数据管理")
             SettingsItem("数据", Icons.Default.Storage) { onNavigate(Screen.Data) }
         }
     }
@@ -1201,6 +1440,99 @@ fun SettingsMenu(
 @Composable
 fun SettingsItem(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
     ListItem(headlineContent = { Text(label) }, leadingContent = { Icon(icon, null) }, trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) }, modifier = Modifier.clickable { onClick() } )
+}
+
+@Composable
+private fun SettingsSectionHeader(label: String) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(start = 16.dp, top = 18.dp, end = 16.dp, bottom = 6.dp)
+    )
+}
+
+private data class AudioDecoderInfo(
+    val mimeType: String,
+    val codecName: String,
+    val implementation: String
+)
+
+private fun queryAudioDecoders(): List<AudioDecoderInfo> = runCatching {
+    MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        .asSequence()
+        .filterNot { it.isEncoder }
+        .flatMap { codec ->
+            val implementation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                when {
+                    codec.isHardwareAccelerated -> "硬件"
+                    codec.isSoftwareOnly -> "软件"
+                    else -> "系统"
+                }
+            } else {
+                if (codec.name.startsWith("OMX.google.", ignoreCase = true)) "软件" else "系统"
+            }
+            codec.supportedTypes.asSequence()
+                .filter { it.startsWith("audio/", ignoreCase = true) }
+                .map { AudioDecoderInfo(it.lowercase(), codec.name, implementation) }
+        }
+        .distinctBy { it.mimeType to it.codecName }
+        .sortedWith(compareBy(AudioDecoderInfo::mimeType, AudioDecoderInfo::codecName))
+        .toList()
+}.getOrDefault(emptyList())
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AudioCodecSupportScreen(onBack: () -> Unit) {
+    val decoders = remember { queryAudioDecoders() }
+    val grouped = remember(decoders) { decoders.groupBy { it.mimeType }.toSortedMap() }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("音频解码支持") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = PaddingValues(bottom = 24.dp)
+        ) {
+            item {
+                ListItem(
+                    headlineContent = { Text("本设备支持 ${grouped.size} 种音频格式") },
+                    supportingContent = { Text("结果来自 Android 系统当前注册的媒体解码器") },
+                    leadingContent = { Icon(Icons.Default.Memory, null) }
+                )
+                HorizontalDivider()
+            }
+            if (grouped.isEmpty()) {
+                item {
+                    Text(
+                        "未读取到可用的音频解码器",
+                        modifier = Modifier.padding(24.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                grouped.forEach { (mimeType, codecs) ->
+                    item { SettingsSectionHeader(mimeType) }
+                    items(codecs) { codec ->
+                        ListItem(
+                            headlineContent = { Text(codec.codecName) },
+                            supportingContent = { Text("${codec.implementation}解码") },
+                            leadingContent = { Icon(Icons.Default.GraphicEq, null) }
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1294,9 +1626,15 @@ private fun SongDetailRow(label: String, value: String) {
 @Composable
 private fun MusicDock(
     currentScreen: Screen,
-    onNavigate: (Screen) -> Unit
+    onNavigate: (Screen) -> Unit,
+    floating: Boolean = false
 ) {
-    NavigationBar {
+    NavigationBar(
+        modifier = if (floating) Modifier.height(68.dp) else Modifier,
+        containerColor = if (floating) Color.Transparent else NavigationBarDefaults.containerColor,
+        tonalElevation = 0.dp,
+        windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
+    ) {
         NavigationBarItem(
             selected = currentScreen == Screen.LocalMusic,
             onClick = { onNavigate(Screen.LocalMusic) },
@@ -1329,6 +1667,48 @@ fun PlaybackSettingsScreen(
     val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
     var usbDacPassthrough by remember {
         mutableStateOf(preferences.getBoolean("usb_dac_passthrough", false))
+    }
+    var overlayEnabled by remember {
+        mutableStateOf(OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning())
+    }
+    val canDrawOverlays = remember {
+        mutableStateOf(android.provider.Settings.canDrawOverlays(context))
+    }
+    val hostActivity = context as? ComponentActivity
+    DisposableEffect(hostActivity) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                canDrawOverlays.value = android.provider.Settings.canDrawOverlays(context)
+                overlayEnabled = OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning()
+                if (OverlayLyricsService.isEnabled(context) && canDrawOverlays.value) {
+                    OverlayLyricsService.startIfEnabled(context)
+                    overlayEnabled = true
+                }
+            }
+        }
+        hostActivity?.lifecycle?.addObserver(observer)
+        onDispose { hostActivity?.lifecycle?.removeObserver(observer) }
+    }
+    fun setOverlayLyrics(enabled: Boolean) {
+        if (enabled) {
+            if (!android.provider.Settings.canDrawOverlays(context)) {
+                OverlayLyricsService.setEnabled(context, true)
+                val intent = Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    "package:${context.packageName}".toUri()
+                )
+                context.startActivity(intent)
+                overlayEnabled = false
+                return
+            }
+            OverlayLyricsService.setEnabled(context, true)
+            OverlayLyricsService.start(context)
+            overlayEnabled = true
+        } else {
+            OverlayLyricsService.setEnabled(context, false)
+            OverlayLyricsService.stop(context)
+            overlayEnabled = false
+        }
     }
     val usbDacConnected = remember {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -1366,6 +1746,144 @@ fun PlaybackSettingsScreen(
                     Switch(checked = isDjMode, onCheckedChange = onDjModeChange)
                 },
                 modifier = Modifier.clickable { onDjModeChange(!isDjMode) }
+            )
+            ListItem(
+                headlineContent = { Text("悬浮歌词") },
+                supportingContent = {
+                    Text(
+                        if (canDrawOverlays.value) {
+                            "在其它应用上方显示可拖动的当前歌词，并按单字高亮进度"
+                        } else {
+                            "需要授予「显示在其他应用上层」权限，点击开关将跳转系统设置"
+                        }
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.Subtitles, null) },
+                trailingContent = {
+                    Switch(
+                        checked = overlayEnabled,
+                        onCheckedChange = { setOverlayLyrics(it) }
+                    )
+                },
+                modifier = Modifier.clickable { setOverlayLyrics(!overlayEnabled) }
+            )
+            var artworkBeatEnabled by remember {
+                mutableStateOf(preferences.getBoolean("artwork_beat_enabled", true))
+            }
+            ListItem(
+                headlineContent = { Text("专辑节奏跳动") },
+                supportingContent = {
+                    Text("播放时专辑封面跟随低频节奏缩放跳动")
+                },
+                leadingContent = { Icon(Icons.Default.BubbleChart, null) },
+                trailingContent = {
+                    Switch(
+                        checked = artworkBeatEnabled,
+                        onCheckedChange = {
+                            artworkBeatEnabled = it
+                            preferences.edit { putBoolean("artwork_beat_enabled", it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    artworkBeatEnabled = !artworkBeatEnabled
+                    preferences.edit { putBoolean("artwork_beat_enabled", artworkBeatEnabled) }
+                }
+            )
+            var spectrumProgressEnabled by remember {
+                mutableStateOf(preferences.getBoolean("spectrum_progress_enabled", true))
+            }
+            ListItem(
+                headlineContent = { Text("频谱进度条") },
+                supportingContent = {
+                    Text("播放页进度条叠加实时频谱，可随时开关")
+                },
+                leadingContent = { Icon(Icons.Default.GraphicEq, null) },
+                trailingContent = {
+                    Switch(
+                        checked = spectrumProgressEnabled,
+                        onCheckedChange = {
+                            spectrumProgressEnabled = it
+                            preferences.edit { putBoolean("spectrum_progress_enabled", it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    spectrumProgressEnabled = !spectrumProgressEnabled
+                    preferences.edit { putBoolean("spectrum_progress_enabled", spectrumProgressEnabled) }
+                }
+            )
+            var openPlayerOnSongClick by remember {
+                mutableStateOf(preferences.getBoolean("open_player_on_song_click", false))
+            }
+            ListItem(
+                headlineContent = { Text("点击歌曲进入播放页") },
+                supportingContent = {
+                    Text(
+                        if (openPlayerOnSongClick) {
+                            "点击列表歌曲后会进入全屏播放页"
+                        } else {
+                            "点击列表歌曲只播放，不进入播放页（可点底部迷你播放器进入）"
+                        }
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.OpenInFull, null) },
+                trailingContent = {
+                    Switch(
+                        checked = openPlayerOnSongClick,
+                        onCheckedChange = {
+                            openPlayerOnSongClick = it
+                            preferences.edit { putBoolean("open_player_on_song_click", it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    openPlayerOnSongClick = !openPlayerOnSongClick
+                    preferences.edit { putBoolean("open_player_on_song_click", openPlayerOnSongClick) }
+                }
+            )
+            ListItem(
+                headlineContent = { Text("桌面歌词部件") },
+                supportingContent = {
+                    Text("长按桌面空白处 → 微件/小部件 → 添加「桌面歌词」，可显示歌词并控制播放")
+                },
+                leadingContent = { Icon(Icons.Default.Widgets, null) }
+            )
+            val audioOutput = rememberAudioOutputSnapshot()
+            ListItem(
+                headlineContent = { Text("当前输出设备") },
+                supportingContent = {
+                    Text(
+                        buildString {
+                            append(audioOutput.summary)
+                            append("\n")
+                            append(audioOutput.latencyLabel)
+                            val details = buildList {
+                                audioOutput.systemLatencyMs?.let { add("系统 ${it}ms") }
+                                audioOutput.bufferLatencyMs?.let { add("缓冲 ${it}ms") }
+                                audioOutput.sampleRateHz?.let { add("${it}Hz") }
+                            }
+                            if (details.isNotEmpty()) {
+                                append("（")
+                                append(details.joinToString(" · "))
+                                append("）")
+                            }
+                            if (audioOutput.allOutputs.size > 1) {
+                                append("\n可用：")
+                                append(audioOutput.allOutputs.joinToString("、"))
+                            }
+                        }
+                    )
+                },
+                leadingContent = {
+                    val icon = when {
+                        audioOutput.typeLabel.contains("蓝牙") -> Icons.Default.Bluetooth
+                        audioOutput.typeLabel.contains("USB") -> Icons.Default.Usb
+                        audioOutput.typeLabel.contains("耳机") -> Icons.Default.Headset
+                        else -> Icons.Default.Speaker
+                    }
+                    Icon(icon, contentDescription = null)
+                }
             )
             ListItem(
                 headlineContent = { Text("USB DAC 直通") },
@@ -1422,7 +1940,10 @@ private val builtInEqualizerPresets = listOf(
     EqualizerPreset("嘻哈", intArrayOf(6, 5, 3, 1, -1, -1, 1, 2, 3, 2)),
     EqualizerPreset("金属", intArrayOf(5, 4, 2, 0, -2, -1, 2, 4, 5, 4)),
     EqualizerPreset("影院", intArrayOf(4, 3, 2, 1, 0, 2, 3, 4, 3, 2)),
-    EqualizerPreset("深夜", intArrayOf(-3, -2, 0, 2, 3, 3, 2, 0, -2, -3))
+    EqualizerPreset("深夜", intArrayOf(-3, -2, 0, 2, 3, 3, 2, 0, -2, -3)),
+    EqualizerPreset("低音增强", intArrayOf(7, 6, 4, 2, 0, -1, -1, 0, 1, 2)),
+    EqualizerPreset("高保真", intArrayOf(3, 2, 1, 0, 0, 0, 1, 2, 3, 4)),
+    EqualizerPreset("播客", intArrayOf(-4, -3, -1, 2, 4, 5, 4, 2, 0, -2))
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1431,19 +1952,52 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
     var gains by remember { mutableStateOf(loadEqualizerGains(preferences)) }
-    var selectedPreset by remember { mutableStateOf("自定义") }
+    var eqEnabled by remember { mutableStateOf(preferences.getBoolean("equalizer_enabled", true)) }
+    var preampDb by remember { mutableIntStateOf(preferences.getInt("equalizer_preamp", 0).coerceIn(-6, 6)) }
+    var bassBoost by remember { mutableIntStateOf(preferences.getInt("bass_boost", 0).coerceIn(0, 1000)) }
+    var virtualizer by remember { mutableIntStateOf(preferences.getInt("virtualizer", 0).coerceIn(0, 1000)) }
+    var selectedPreset by remember { mutableStateOf(preferences.getString("equalizer_preset_name", "自定义") ?: "自定义") }
     var presetMenuExpanded by remember { mutableStateOf(false) }
+    val usbDacPassthrough = preferences.getBoolean("usb_dac_passthrough", false)
 
     val applyScope = rememberCoroutineScope()
     var pendingApplyJob by remember { mutableStateOf<Job?>(null) }
-    fun scheduleEqualizerApply(nextGains: IntArray) {
-        preferences.edit { putString("equalizer_gains", nextGains.joinToString(",")) }
+
+    fun persistAndApply(
+        nextGains: IntArray = gains,
+        enabled: Boolean = eqEnabled,
+        preamp: Int = preampDb,
+        bass: Int = bassBoost,
+        virt: Int = virtualizer,
+        presetName: String = selectedPreset
+    ) {
+        preferences.edit {
+            putString("equalizer_gains", nextGains.joinToString(","))
+            putBoolean("equalizer_enabled", enabled)
+            putInt("equalizer_preamp", preamp)
+            putInt("bass_boost", bass)
+            putInt("virtualizer", virt)
+            putString("equalizer_preset_name", presetName)
+        }
         pendingApplyJob?.cancel()
         pendingApplyJob = applyScope.launch {
-            delay(50)
-            applyEqualizerSettings(context, nextGains)
+            delay(35)
+            applyEqualizerSettings(
+                context = context,
+                gains = nextGains,
+                enabled = enabled,
+                preampDb = preamp,
+                bassBoost = bass,
+                virtualizer = virt
+            )
         }
     }
+
+    // 进入页面时重新下发一次，确保挂到当前播放会话
+    LaunchedEffect(Unit) {
+        applyEqualizerSettings(context, gains, eqEnabled, preampDb, bassBoost, virtualizer)
+    }
+
     val personalPreset = remember {
         preferences.getString("equalizer_custom_gains", null)?.let(::parseEqualizerGains)
     }
@@ -1451,10 +2005,14 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
         builtInEqualizerPresets + listOfNotNull(personalPreset?.let { EqualizerPreset("个人", it) })
     }
 
+    val primary = MaterialTheme.colorScheme.primary
+    val secondary = MaterialTheme.colorScheme.secondary
+    val outline = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("均衡器") },
+                title = { Text("专业均衡器") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
@@ -1464,8 +2022,17 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                     IconButton(
                         onClick = {
                             gains = IntArray(equalizerFrequencies.size)
+                            preampDb = 0
+                            bassBoost = 0
+                            virtualizer = 0
                             selectedPreset = "平直"
-                            applyEqualizerSettings(context, gains)
+                            persistAndApply(
+                                nextGains = gains,
+                                preamp = 0,
+                                bass = 0,
+                                virt = 0,
+                                presetName = "平直"
+                            )
                         }
                     ) {
                         Icon(Icons.Default.RestartAlt, "重置")
@@ -1481,10 +2048,114 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
-            Text("频率增益", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            ListItem(
+                headlineContent = { Text("启用均衡器") },
+                supportingContent = {
+                    Text(if (eqEnabled) "频段、前置增益、低音与环绕均生效" else "已旁路，输出接近原始音质")
+                },
+                leadingContent = { Icon(Icons.Default.GraphicEq, null) },
+                trailingContent = {
+                    Switch(
+                        checked = eqEnabled,
+                        onCheckedChange = {
+                            eqEnabled = it
+                            persistAndApply(enabled = it)
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    eqEnabled = !eqEnabled
+                    persistAndApply(enabled = eqEnabled)
+                }
+            )
+
+            if (usbDacPassthrough) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "当前已开启 USB DAC 直通，均衡器不会生效。请到「播放设置」关闭直通后再试。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            } else {
+                Text(
+                    "10 段参数均衡 + 前置增益 + 低音增强 + 环绕声场。调节后立即作用于当前播放。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text("频率响应", style = MaterialTheme.typography.titleMedium, color = primary)
+            Spacer(Modifier.height(8.dp))
+            // 专业响应曲线
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(140.dp)
+            ) {
+                val left = 8.dp.toPx()
+                val right = size.width - 8.dp.toPx()
+                val top = 12.dp.toPx()
+                val bottom = size.height - 18.dp.toPx()
+                val midY = (top + bottom) / 2f
+                val width = (right - left).coerceAtLeast(1f)
+                val height = (bottom - top).coerceAtLeast(1f)
+
+                // 网格
+                for (i in 0..4) {
+                    val y = top + height * i / 4f
+                    drawLine(outline, Offset(left, y), Offset(right, y), strokeWidth = 1f)
+                }
+                for (i in 0 until equalizerFrequencies.size) {
+                    val x = left + width * i / (equalizerFrequencies.size - 1).coerceAtLeast(1)
+                    drawLine(outline.copy(alpha = 0.2f), Offset(x, top), Offset(x, bottom), 1f)
+                }
+                // 0dB 线
+                drawLine(primary.copy(alpha = 0.35f), Offset(left, midY), Offset(right, midY), 2f)
+
+                if (gains.isNotEmpty()) {
+                    val maxDb = 15f
+                    val pts = gains.mapIndexed { index, g ->
+                        val x = left + width * index / (gains.size - 1).coerceAtLeast(1)
+                        val total = (g + preampDb).coerceIn(-15, 15).toFloat()
+                        val y = midY - (total / maxDb) * (height / 2f)
+                        Offset(x, y)
+                    }
+                    // 填充
+                    val fillPath = Path().apply {
+                        moveTo(pts.first().x, midY)
+                        pts.forEach { lineTo(it.x, it.y) }
+                        lineTo(pts.last().x, midY)
+                        close()
+                    }
+                    drawPath(
+                        fillPath,
+                        brush = Brush.verticalGradient(
+                            listOf(primary.copy(alpha = 0.28f), secondary.copy(alpha = 0.08f))
+                        )
+                    )
+                    // 曲线
+                    for (i in 0 until pts.lastIndex) {
+                        drawLine(
+                            color = if (eqEnabled) primary else outline,
+                            start = pts[i],
+                            end = pts[i + 1],
+                            strokeWidth = 3.dp.toPx()
+                        )
+                    }
+                    pts.forEach { p ->
+                        drawCircle(
+                            color = if (eqEnabled) secondary else outline,
+                            radius = 3.5.dp.toPx(),
+                            center = p
+                        )
+                    }
+                }
+            }
+
             Spacer(Modifier.height(8.dp))
             Box {
-                OutlinedButton(onClick = { presetMenuExpanded = true }) {
+                OutlinedButton(onClick = { presetMenuExpanded = true }, enabled = eqEnabled) {
                     Icon(Icons.Default.Tune, null)
                     Spacer(Modifier.width(8.dp))
                     Text("预设：$selectedPreset")
@@ -1502,13 +2173,82 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                                 gains = preset.gains.copyOf()
                                 selectedPreset = preset.name
                                 presetMenuExpanded = false
-                                scheduleEqualizerApply(gains)
+                                persistAndApply(nextGains = gains, presetName = preset.name)
                             }
                         )
                     }
                 }
             }
+
             Spacer(Modifier.height(12.dp))
+            Text("前置增益", style = MaterialTheme.typography.titleSmall, color = primary)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Preamp", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
+                Slider(
+                    value = preampDb.toFloat(),
+                    onValueChange = {
+                        preampDb = it.toInt()
+                        selectedPreset = "自定义"
+                        persistAndApply(preamp = preampDb, presetName = "自定义")
+                    },
+                    valueRange = -6f..6f,
+                    steps = 11,
+                    enabled = eqEnabled,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = String.format(Locale.getDefault(), "%+d dB", preampDb),
+                    modifier = Modifier.width(62.dp),
+                    textAlign = TextAlign.End,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+
+            Text("低音增强", style = MaterialTheme.typography.titleSmall, color = primary)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Bass", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
+                Slider(
+                    value = bassBoost / 10f,
+                    onValueChange = {
+                        bassBoost = (it * 10f).toInt().coerceIn(0, 1000)
+                        persistAndApply(bass = bassBoost)
+                    },
+                    valueRange = 0f..100f,
+                    enabled = eqEnabled,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "${bassBoost / 10}%",
+                    modifier = Modifier.width(62.dp),
+                    textAlign = TextAlign.End,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+
+            Text("环绕声场", style = MaterialTheme.typography.titleSmall, color = primary)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Space", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
+                Slider(
+                    value = virtualizer / 10f,
+                    onValueChange = {
+                        virtualizer = (it * 10f).toInt().coerceIn(0, 1000)
+                        persistAndApply(virt = virtualizer)
+                    },
+                    valueRange = 0f..100f,
+                    enabled = eqEnabled,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "${virtualizer / 10}%",
+                    modifier = Modifier.width(62.dp),
+                    textAlign = TextAlign.End,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text("十段参数均衡", style = MaterialTheme.typography.titleMedium, color = primary)
+            Spacer(Modifier.height(4.dp))
             equalizerFrequencies.forEachIndexed { index, frequency ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -1521,10 +2261,11 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                         onValueChange = { value ->
                             gains = gains.copyOf().also { it[index] = value.toInt() }
                             selectedPreset = "自定义"
-                            scheduleEqualizerApply(gains)
+                            persistAndApply(nextGains = gains, presetName = "自定义")
                         },
-                        valueRange = -12f..12f,
-                        steps = 23,
+                        valueRange = -15f..15f,
+                        steps = 29,
+                        enabled = eqEnabled,
                         modifier = Modifier.weight(1f)
                     )
                     Text(
@@ -1535,24 +2276,22 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                     )
                 }
             }
-            
+
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            OutlinedButton(
+                onClick = {
+                    preferences.edit { putString("equalizer_custom_gains", gains.joinToString(",")) }
+                    selectedPreset = "个人"
+                    preferences.edit { putString("equalizer_preset_name", "个人") }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = eqEnabled
             ) {
-                OutlinedButton(
-                    onClick = {
-                        preferences.edit { putString("equalizer_custom_gains", gains.joinToString(",")) }
-                        selectedPreset = "个人"
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Icon(Icons.Default.Save, null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("保存个人频率预设")
-                }
+                Icon(Icons.Default.Save, null)
+                Spacer(Modifier.width(6.dp))
+                Text("保存为个人预设")
             }
+            Spacer(Modifier.height(72.dp))
         }
     }
 }
@@ -1564,17 +2303,44 @@ private fun loadEqualizerGains(preferences: android.content.SharedPreferences): 
 
 private fun parseEqualizerGains(value: String): IntArray {
     val values = value.split(',').mapNotNull { it.toIntOrNull() }
-    return IntArray(equalizerFrequencies.size) { values.getOrElse(it) { 0 }.coerceIn(-12, 12) }
+    return IntArray(equalizerFrequencies.size) { values.getOrElse(it) { 0 }.coerceIn(-15, 15) }
 }
 
-private fun applyEqualizerSettings(context: Context, gains: IntArray) {
+private fun applyEqualizerSettings(
+    context: Context,
+    gains: IntArray,
+    enabled: Boolean = true,
+    preampDb: Int = 0,
+    bassBoost: Int = 0,
+    virtualizer: Int = 0
+) {
     context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
-        .edit { putString("equalizer_gains", gains.joinToString(",")) }
-    context.startService(
-        Intent(context, PlaybackService::class.java)
-            .setAction(PlaybackService.ACTION_APPLY_EQUALIZER)
-            .putExtra(PlaybackService.EXTRA_GAINS, gains)
-    )
+        .edit {
+            putString("equalizer_gains", gains.joinToString(","))
+            putBoolean("equalizer_enabled", enabled)
+            putInt("equalizer_preamp", preampDb)
+            putInt("bass_boost", bassBoost)
+            putInt("virtualizer", virtualizer)
+        }
+    val intent = Intent(context, PlaybackService::class.java)
+        .setAction(PlaybackService.ACTION_APPLY_EQUALIZER)
+        .putExtra(PlaybackService.EXTRA_GAINS, gains.copyOf())
+        .putExtra(PlaybackService.EXTRA_EQ_ENABLED, enabled)
+        .putExtra(PlaybackService.EXTRA_PREAMP, preampDb)
+        .putExtra(PlaybackService.EXTRA_BASS_BOOST, bassBoost)
+        .putExtra(PlaybackService.EXTRA_VIRTUALIZER, virtualizer)
+    // 前台应用内启动：优先普通 startService；失败再尝试前台服务启动
+    runCatching { context.startService(intent) }
+        .recoverCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+        .onFailure {
+            android.util.Log.e("Equalizer", "无法将均衡器参数发送到播放服务: ${it.message}")
+        }
 }
 
 private fun formatEqualizerFrequency(frequency: Int): String =
@@ -2052,6 +2818,56 @@ fun AudioFormatBadges(
 }
 
 @Composable
+fun AudioOutputBadge(
+    output: AudioOutputSnapshot,
+    centered: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    val containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+    val contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+    val icon = when {
+        output.typeLabel.contains("蓝牙") -> Icons.Default.Bluetooth
+        output.typeLabel.contains("USB") -> Icons.Default.Usb
+        output.typeLabel.contains("耳机") -> Icons.Default.Headset
+        output.typeLabel.contains("HDMI") -> Icons.Default.SettingsInputHdmi
+        output.typeLabel.contains("扬声器") || output.typeLabel.contains("听筒") -> Icons.Default.Speaker
+        else -> Icons.Default.SpeakerGroup
+    }
+    Row(
+        modifier = modifier
+            .padding(top = 6.dp)
+            .horizontalScroll(rememberScrollState()),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = if (centered) Arrangement.Center else Arrangement.Start
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(containerColor)
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, contentDescription = "输出设备", Modifier.size(14.dp), tint = contentColor)
+            Spacer(Modifier.width(4.dp))
+            Text(
+                text = buildString {
+                    append("输出 · ")
+                    append(output.summary)
+                    if (output.latencyMs != null) {
+                        append(" · ")
+                        append(output.latencyLabel)
+                    }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = contentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
 private fun AnimatedSongText(
     song: Song,
     songs: List<Song>,
@@ -2162,10 +2978,27 @@ fun FullPlayerScreen(
 
     // 按需加载封面（避免播放页首次显示时主线程解码卡顿）
     val playerArtwork = rememberArtwork(song)
+    val playerPrefs = remember {
+        context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
+    }
+    var artworkBeatEnabled by remember {
+        mutableStateOf(playerPrefs.getBoolean("artwork_beat_enabled", true))
+    }
+    var spectrumProgressEnabled by remember {
+        mutableStateOf(playerPrefs.getBoolean("spectrum_progress_enabled", true))
+    }
+    // 从设置返回时刷新开关
+    LaunchedEffect(song.uri, isPlaying) {
+        artworkBeatEnabled = playerPrefs.getBoolean("artwork_beat_enabled", true)
+        spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
+    }
+    val beatEnergy = rememberBeatEnergy(isPlaying = isPlaying, enabled = artworkBeatEnabled)
+    val beatScale = beatScaleFromEnergy(beatEnergy)
     // 按需加载音频格式信息（采样率/比特率），不阻塞主线程
     val audioFormat = remember(song.uri) {
         mutableStateOf<AudioFormatInfo?>(null)
     }
+    val audioOutput = rememberAudioOutputSnapshot()
     LaunchedEffect(song.uri) {
         if (audioFormat.value == null) {
             val info = withContext(Dispatchers.IO) {
@@ -2270,12 +3103,24 @@ fun FullPlayerScreen(
                                     androidx.compose.foundation.Image(
                                         targetArtwork.asImageBitmap(),
                                         null,
-                                        Modifier.size(artworkSize).clip(RoundedCornerShape(20.dp)),
+                                        Modifier
+                                            .size(artworkSize)
+                                            .graphicsLayer {
+                                                scaleX = beatScale
+                                                scaleY = beatScale
+                                            }
+                                            .clip(RoundedCornerShape(20.dp)),
                                         contentScale = ContentScale.Crop
                                     )
                                 } else {
                                     Surface(
-                                        Modifier.size(artworkSize).clip(RoundedCornerShape(20.dp)),
+                                        Modifier
+                                            .size(artworkSize)
+                                            .graphicsLayer {
+                                                scaleX = beatScale
+                                                scaleY = beatScale
+                                            }
+                                            .clip(RoundedCornerShape(20.dp)),
                                         color = MaterialTheme.colorScheme.primaryContainer
                                     ) {
                                         Box(contentAlignment = Alignment.Center) {
@@ -2298,7 +3143,7 @@ fun FullPlayerScreen(
                 }
 
                 Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                    Slider(
+                    SpectrumProgressSlider(
                         value = sliderPosition,
                         onValueChange = {
                             isDragging = true
@@ -2308,6 +3153,8 @@ fun FullPlayerScreen(
                             onSeek((sliderPosition * duration).toLong())
                             isDragging = false
                         },
+                        isPlaying = isPlaying,
+                        spectrumEnabled = spectrumProgressEnabled,
                         colors = SliderDefaults.colors(
                             thumbColor = MaterialTheme.colorScheme.primary,
                             activeTrackColor = MaterialTheme.colorScheme.primary
@@ -2368,18 +3215,33 @@ fun FullPlayerScreen(
                                 rotation = turntableRotation,
                                 speed = scratchSpeed,
                                 isScratching = isDragging,
+                                beatScale = beatScale,
                                 onClick = { showLyrics = true }
                             )
                         } else if (targetArtwork != null) {
                             androidx.compose.foundation.Image(
                                 targetArtwork.asImageBitmap(),
                                 null,
-                                Modifier.size(artworkSize).clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp)).clickable { showLyrics = true },
+                                Modifier
+                                    .size(artworkSize)
+                                    .graphicsLayer {
+                                        scaleX = beatScale
+                                        scaleY = beatScale
+                                    }
+                                    .clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp))
+                                    .clickable { showLyrics = true },
                                 contentScale = ContentScale.Crop
                             )
                         } else {
                             Surface(
-                                Modifier.size(artworkSize).clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp)).clickable { showLyrics = true },
+                                Modifier
+                                    .size(artworkSize)
+                                    .graphicsLayer {
+                                        scaleX = beatScale
+                                        scaleY = beatScale
+                                    }
+                                    .clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp))
+                                    .clickable { showLyrics = true },
                                 shadowElevation = 16.dp,
                                 color = MaterialTheme.colorScheme.primaryContainer
                             ) { Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MusicNote, null, Modifier.size(120.dp), MaterialTheme.colorScheme.onPrimaryContainer) } }
@@ -2395,12 +3257,28 @@ fun FullPlayerScreen(
                         androidx.compose.foundation.Image(
                             playerArtwork.asImageBitmap(),
                             null,
-                            Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)).clickable { showLyrics = false },
+                            Modifier
+                                .size(56.dp)
+                                .graphicsLayer {
+                                    val s = 1f + (beatScale - 1f) * 0.7f
+                                    scaleX = s
+                                    scaleY = s
+                                }
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { showLyrics = false },
                             contentScale = ContentScale.Crop
                         )
                     } else {
                         Surface(
-                            Modifier.size(56.dp).clip(RoundedCornerShape(8.dp)).clickable { showLyrics = false },
+                            Modifier
+                                .size(56.dp)
+                                .graphicsLayer {
+                                    val s = 1f + (beatScale - 1f) * 0.7f
+                                    scaleX = s
+                                    scaleY = s
+                                }
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { showLyrics = false },
                             color = MaterialTheme.colorScheme.primaryContainer
                         ) { Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.MusicNote, null, Modifier.size(28.dp), MaterialTheme.colorScheme.onPrimaryContainer) } }
                     }
@@ -2433,6 +3311,7 @@ fun FullPlayerScreen(
                         }
                         AnimatedArtistText(song = song, songs = songs, style = MaterialTheme.typography.bodyMedium)
                         AudioFormatBadges(audioFormat = audioFormat.value, fileSize = song.duration, centered = false)
+                        AudioOutputBadge(output = audioOutput, centered = false)
                     }
                 }
             } else {
@@ -2466,10 +3345,11 @@ fun FullPlayerScreen(
                     }
                     AnimatedArtistText(song = song, songs = songs, style = MaterialTheme.typography.titleMedium)
                     AudioFormatBadges(audioFormat = audioFormat.value, fileSize = song.duration, centered = true, modifier = Modifier.fillMaxWidth())
+                    AudioOutputBadge(output = audioOutput, centered = true, modifier = Modifier.fillMaxWidth())
                 }
             }
             Column(Modifier.fillMaxWidth()) {
-                Slider(
+                SpectrumProgressSlider(
                     value = sliderPosition,
                     onValueChange = { value ->
                         val now = android.os.SystemClock.uptimeMillis()
@@ -2502,6 +3382,8 @@ fun FullPlayerScreen(
                         scratchSpeed = 1f
                         isDragging = false
                     },
+                    isPlaying = isPlaying,
+                    spectrumEnabled = spectrumProgressEnabled,
                     colors = SliderDefaults.colors(
                         thumbColor = MaterialTheme.colorScheme.primary,
                         activeTrackColor = MaterialTheme.colorScheme.primary
@@ -2538,11 +3420,16 @@ fun DjTurntable(
     rotation: Float,
     speed: Float,
     isScratching: Boolean,
+    beatScale: Float = 1f,
     onClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
             .size(size)
+            .graphicsLayer {
+                scaleX = beatScale
+                scaleY = beatScale
+            }
             .clip(CircleShape)
             .background(Color(0xFF101010))
             .border(2.dp, Color.White.copy(alpha = 0.18f), CircleShape)

@@ -1,10 +1,10 @@
 {
     "logs": [
         {
-            "outputFile": "com.example.music.app-mergeDebugResources-43:/values-v30/values-v30.xml",
+            "outputFile": "com.example.music.app-mergeDebugResources-51:/values-v30/values-v30.xml",
             "map": [
                 {
-                    "source": "D:\\USER\\Administrator\\.gradle\\caches\\9.4.1\\transforms\\d97e337bb3c3bf1cf80f1ac4e0b4ef71\\transformed\\material3\\res\\values-v30\\values-v30.xml",
+                    "source": "D:\\USER\\Administrator\\.gradle\\caches\\9.3.0\\transforms\\ee6085a97796151cd5ede32ddfe7416b\\workspace\\transformed\\jetified-material3-release\\res\\values-v30\\values-v30.xml",
                     "from": {
                         "startLines": "2",
                         "startColumns": "4",
