@@ -6,15 +6,13 @@ import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
-import android.media.AudioDeviceInfo
-import android.media.AudioManager
 import android.media.MediaCodecList
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -72,6 +70,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.SpanStyle
@@ -110,6 +109,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.debounce
 
@@ -461,6 +461,42 @@ object DataManager {
     }
 }
 
+object SmoothAnimationFrameRate {
+    @Volatile
+    var enabled: Boolean = false
+
+    val frameDelayMillis: Long
+        get() = if (enabled) 8L else 16L
+}
+
+/** 开启时优先 120Hz，关闭时锁定 60Hz。 */
+private fun applySmoothAnimationMode(activity: android.app.Activity, enabled: Boolean) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    SmoothAnimationFrameRate.enabled = enabled
+    val display = activity.windowManager.defaultDisplay
+    val currentMode = display.mode
+    val sameResolutionModes = display.supportedModes.filter {
+        it.physicalWidth == currentMode.physicalWidth &&
+            it.physicalHeight == currentMode.physicalHeight
+    }
+    val targetMode = if (enabled) {
+        sameResolutionModes
+            .filter { kotlin.math.abs(it.refreshRate - 120f) < 1f }
+            .maxByOrNull { it.refreshRate }
+            ?: sameResolutionModes.maxByOrNull { it.refreshRate }
+    } else {
+        sameResolutionModes
+            .filter { kotlin.math.abs(it.refreshRate - 60f) < 1f }
+            .maxByOrNull { it.refreshRate }
+            ?: sameResolutionModes.minByOrNull { kotlin.math.abs(it.refreshRate - 60f) }
+    }
+
+    activity.window.attributes = activity.window.attributes.apply {
+        preferredDisplayModeId = targetMode?.modeId ?: currentMode.modeId
+        preferredRefreshRate = targetMode?.refreshRate ?: 60f
+    }
+}
+
 class MainActivity : ComponentActivity() {
     private var player: Player? by mutableStateOf(null)
     private var initError: String? by mutableStateOf(null)
@@ -494,10 +530,12 @@ class MainActivity : ComponentActivity() {
         val savedAmoledMode = prefs.getBoolean("is_amoled_mode", false)
         val savedDjMode = prefs.getBoolean("is_dj_mode", false)
         val savedPlayerLandscape = prefs.getBoolean("player_landscape", false)
+        val savedSmoothAnimationMode = prefs.getBoolean("smooth_animation_mode", false)
         val lastUri = LastPlaybackManager.loadUri(this)
         val lastPosition = LastPlaybackManager.loadPosition(this)
         val lastDuration = LastPlaybackManager.loadDuration(this)
 
+        applySmoothAnimationMode(this, savedSmoothAnimationMode)
         enableEdgeToEdge()
         setContent {
             var dockPosition by remember { mutableStateOf(prefs.getString("dock_position", "bottom") ?: "bottom") }
@@ -543,6 +581,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applySmoothAnimationMode(
+            this,
+            prefs.getBoolean("smooth_animation_mode", false)
+        )
     }
 
     override fun onDestroy() {
@@ -621,10 +667,29 @@ fun MusicApp(
 ) {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
+    val appPreferences = remember {
+        context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
+    }
+    val initialFullscreenPlayerMode = remember(initialLastUri, initialSongs) {
+        appPreferences.getBoolean("fullscreen_player_mode", false) &&
+            initialSongs.any { it.uri == initialLastUri }
+    }
+    LaunchedEffect(initialFullscreenPlayerMode) {
+        if (!initialFullscreenPlayerMode &&
+            appPreferences.getBoolean("fullscreen_player_mode", false)
+        ) {
+            appPreferences.edit { putBoolean("fullscreen_player_mode", false) }
+        }
+    }
     // 重启 Activity：用于清除全部数据 / 导入配置后重新加载所有状态
     val restartActivity: () -> Unit = { activity?.recreate() }
     val scope = rememberCoroutineScope()
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
+    var fullscreenPlayerMode by remember { mutableStateOf(initialFullscreenPlayerMode) }
+    var currentScreen by remember {
+        mutableStateOf<Screen>(
+            if (initialFullscreenPlayerMode) Screen.PlayerView else Screen.LocalMusic
+        )
+    }
     var previousScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
     LaunchedEffect(currentScreen, playerLandscape) {
         activity?.requestedOrientation = when {
@@ -882,16 +947,30 @@ fun MusicApp(
     // 不再自动扫描，用户在音乐库设置中点"立即扫描"按钮后才扫描
     LaunchedEffect(Unit) { /* 故意留空：禁用启动时及目录变化时的自动扫描 */ }
 
-    // 提取统一的返回逻辑
-    val handleBack = {
-        currentScreen = when (currentScreen) {
-            Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs -> Screen.Settings
-            Screen.Equalizer -> Screen.LocalMusic
-            Screen.WebDav -> Screen.Settings
-            Screen.LocalMusic -> Screen.LocalMusic
-            Screen.PlayerView -> previousScreen
-            else -> Screen.LocalMusic
+    val setFullscreenPlayerMode: (Boolean) -> Unit = { enabled ->
+        if (!enabled || currentSong != null) {
+            fullscreenPlayerMode = enabled
+            appPreferences.edit { putBoolean("fullscreen_player_mode", enabled) }
+            previousScreen = Screen.LocalMusic
+            currentScreen = if (enabled) Screen.PlayerView else Screen.LocalMusic
         }
+    }
+
+    // 提取统一的返回逻辑
+    val handleBack: () -> Unit = {
+        if (fullscreenPlayerMode && currentScreen == Screen.PlayerView) {
+            activity?.moveTaskToBack(true)
+        } else {
+            currentScreen = when (currentScreen) {
+                Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs -> Screen.Settings
+                Screen.Equalizer -> Screen.LocalMusic
+                Screen.WebDav -> Screen.Settings
+                Screen.LocalMusic -> Screen.LocalMusic
+                Screen.PlayerView -> previousScreen
+                else -> Screen.LocalMusic
+            }
+        }
+        Unit
     }
 
     val playSongFromQuickList: (Song) -> Unit = { selectedSong ->
@@ -914,14 +993,43 @@ fun MusicApp(
         }
     }
 
-    // 主界面按系统返回键退出应用，其他页面返回到各自的上一级页面。
-    BackHandler(enabled = currentScreen != Screen.LocalMusic) {
-        handleBack()
+    var predictiveBackProgress by remember { mutableFloatStateOf(0f) }
+    var predictiveBackDirection by remember { mutableFloatStateOf(1f) }
+    // 音乐库根页面由系统执行返回桌面动画，其余页面统一使用预见式返回。
+    PredictiveBackHandler(enabled = currentScreen != Screen.LocalMusic) { progress ->
+        try {
+            progress.collect { backEvent ->
+                predictiveBackProgress = backEvent.progress.coerceIn(0f, 1f)
+                predictiveBackDirection = if (
+                    backEvent.swipeEdge == androidx.activity.BackEventCompat.EDGE_RIGHT
+                ) {
+                    -1f
+                } else {
+                    1f
+                }
+            }
+            handleBack()
+        } catch (_: java.util.concurrent.CancellationException) {
+            // 用户取消返回手势时恢复当前页面。
+        } finally {
+            predictiveBackProgress = 0f
+            predictiveBackDirection = 1f
+        }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                val progress = predictiveBackProgress.coerceIn(0f, 1f)
+                translationX = size.width * 0.14f * progress * predictiveBackDirection
+                scaleX = 1f - progress * 0.025f
+                scaleY = 1f - progress * 0.025f
+                alpha = 1f - progress * 0.12f
+            }
+    ) {
         val dockScreens = setOf(Screen.LocalMusic, Screen.Equalizer, Screen.Settings)
-        val showDock = currentScreen in dockScreens
+        val showDock = !fullscreenPlayerMode && currentScreen in dockScreens
         val isFloatDock = dockPosition.equals("float", ignoreCase = true)
         // 悬浮层仅用于音乐列表，避免遮挡设置/均衡器等其它页面
         val floatOverlayActive = isFloatDock && currentScreen == Screen.LocalMusic
@@ -1030,6 +1138,8 @@ fun MusicApp(
                                     onNext = { player.seekToNext() },
                                     onPrevious = { player.seekToPrevious() },
                                     onBack = handleBack,
+                                    onExitFullscreenMode = { setFullscreenPlayerMode(false) },
+                                    fullscreenPlayerMode = fullscreenPlayerMode,
                                     context = context,
                                     musicDirectories = musicDirectories.toList(),
                                     songs = songs,
@@ -1079,7 +1189,7 @@ fun MusicApp(
                                 val openOnClick = context
                                     .getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
                                     .getBoolean("open_player_on_song_click", false)
-                                if (openOnClick) openPlayer()
+                                if (fullscreenPlayerMode || openOnClick) openPlayer()
                             },
                             onReorder = { from, to ->
                                 val newList = songs.toMutableList()
@@ -1126,6 +1236,9 @@ fun MusicApp(
                         Screen.Playback -> PlaybackSettingsScreen(
                             isDjMode = isDjMode,
                             onDjModeChange = onDjModeChange,
+                            fullscreenPlayerMode = fullscreenPlayerMode,
+                            hasCurrentSong = currentSong != null,
+                            onFullscreenPlayerModeChange = setFullscreenPlayerMode,
                             onBack = { currentScreen = Screen.Settings }
                         )
                         Screen.AudioCodecs -> AudioCodecSupportScreen(
@@ -1361,6 +1474,21 @@ fun SettingsMenu(
     onAmoledModeChange: (Boolean) -> Unit,
     onNavigate: (Screen) -> Unit
 ) {
+    val context = LocalContext.current
+    val preferences = remember {
+        context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
+    }
+    var smoothAnimationMode by remember {
+        mutableStateOf(preferences.getBoolean("smooth_animation_mode", false))
+    }
+    fun setSmoothAnimationMode(enabled: Boolean) {
+        smoothAnimationMode = enabled
+        preferences.edit { putBoolean("smooth_animation_mode", enabled) }
+        (context as? android.app.Activity)?.let { activity ->
+            applySmoothAnimationMode(activity, enabled)
+        }
+    }
+
     Scaffold(topBar = { TopAppBar(title = { Text("设置") }) }) { padding ->
         Column(Modifier.padding(padding).verticalScroll(rememberScrollState())) {
             ListItem(
@@ -1423,6 +1551,28 @@ fun SettingsMenu(
                 leadingContent = { Icon(Icons.Default.Brightness2, null) },
                 trailingContent = { Switch(isAmoledMode, onAmoledModeChange) },
                 modifier = Modifier.clickable { onAmoledModeChange(!isAmoledMode) }
+            )
+            ListItem(
+                headlineContent = { Text("流畅动画模式") },
+                supportingContent = {
+                    Text(
+                        if (smoothAnimationMode) {
+                            "整个应用优先使用 120 FPS；不支持时自动使用设备最高刷新率"
+                        } else {
+                            "当前固定 60 FPS；开启后让全部页面和动画使用高刷新率"
+                        }
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.Speed, null) },
+                trailingContent = {
+                    Switch(
+                        checked = smoothAnimationMode,
+                        onCheckedChange = { setSmoothAnimationMode(it) }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    setSmoothAnimationMode(!smoothAnimationMode)
+                }
             )
             HorizontalDivider()
             SettingsSectionHeader("界面与播放")
@@ -1629,8 +1779,41 @@ private fun MusicDock(
     onNavigate: (Screen) -> Unit,
     floating: Boolean = false
 ) {
+    val dockScreens = remember {
+        listOf(Screen.LocalMusic, Screen.Equalizer, Screen.Settings)
+    }
+    val dragThreshold = with(LocalDensity.current) { 48.dp.toPx() }
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+    val dockModifier = (if (floating) Modifier.height(68.dp) else Modifier)
+        .graphicsLayer {
+            translationX = dragOffset * 0.16f
+        }
+        .pointerInput(currentScreen, dragThreshold) {
+            detectHorizontalDragGestures(
+                onDragCancel = { dragOffset = 0f },
+                onDragEnd = {
+                    val currentIndex = dockScreens.indexOf(currentScreen)
+                    if (currentIndex >= 0 && kotlin.math.abs(dragOffset) >= dragThreshold) {
+                        val targetIndex = if (dragOffset < 0f) {
+                            (currentIndex + 1).coerceAtMost(dockScreens.lastIndex)
+                        } else {
+                            (currentIndex - 1).coerceAtLeast(0)
+                        }
+                        if (targetIndex != currentIndex) {
+                            onNavigate(dockScreens[targetIndex])
+                        }
+                    }
+                    dragOffset = 0f
+                }
+            ) { change, dragAmount ->
+                change.consume()
+                dragOffset = (dragOffset + dragAmount)
+                    .coerceIn(-dragThreshold * 1.5f, dragThreshold * 1.5f)
+            }
+        }
+
     NavigationBar(
-        modifier = if (floating) Modifier.height(68.dp) else Modifier,
+        modifier = dockModifier,
         containerColor = if (floating) Color.Transparent else NavigationBarDefaults.containerColor,
         tonalElevation = 0.dp,
         windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
@@ -1661,13 +1844,13 @@ private fun MusicDock(
 fun PlaybackSettingsScreen(
     isDjMode: Boolean,
     onDjModeChange: (Boolean) -> Unit,
+    fullscreenPlayerMode: Boolean,
+    hasCurrentSong: Boolean,
+    onFullscreenPlayerModeChange: (Boolean) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
-    var usbDacPassthrough by remember {
-        mutableStateOf(preferences.getBoolean("usb_dac_passthrough", false))
-    }
     var overlayEnabled by remember {
         mutableStateOf(OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning())
     }
@@ -1710,13 +1893,6 @@ fun PlaybackSettingsScreen(
             overlayEnabled = false
         }
     }
-    val usbDacConnected = remember {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
-            it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-        }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1736,6 +1912,33 @@ fun PlaybackSettingsScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            ListItem(
+                headlineContent = { Text("全屏播放模式") },
+                supportingContent = {
+                    Text(
+                        when {
+                            !hasCurrentSong -> "请先播放一首歌曲后再开启"
+                            fullscreenPlayerMode -> "锁定播放页；左上角退出模式，下滑或系统返回直接回到桌面"
+                            else -> "隐藏音乐库与 Dock，锁定显示全屏播放页"
+                        }
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.Fullscreen, null) },
+                trailingContent = {
+                    Switch(
+                        checked = fullscreenPlayerMode,
+                        onCheckedChange = onFullscreenPlayerModeChange,
+                        enabled = hasCurrentSong
+                    )
+                },
+                modifier = if (hasCurrentSong) {
+                    Modifier.clickable {
+                        onFullscreenPlayerModeChange(!fullscreenPlayerMode)
+                    }
+                } else {
+                    Modifier
+                }
+            )
             ListItem(
                 headlineContent = { Text("打碟模式") },
                 supportingContent = {
@@ -1885,42 +2088,6 @@ fun PlaybackSettingsScreen(
                     Icon(icon, contentDescription = null)
                 }
             )
-            ListItem(
-                headlineContent = { Text("USB DAC 直通") },
-                supportingContent = {
-                    Text(
-                        if (usbDacConnected) {
-                            "已检测到 USB DAC；直通模式会关闭应用内均衡器和音效处理"
-                        } else {
-                            "未检测到 USB DAC；连接后将由系统自动路由媒体音频"
-                        }
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.Usb, null) },
-                trailingContent = {
-                    Switch(
-                        checked = usbDacPassthrough,
-                        onCheckedChange = { enabled ->
-                            usbDacPassthrough = enabled
-                            preferences.edit { putBoolean("usb_dac_passthrough", enabled) }
-                            context.startService(
-                                Intent(context, PlaybackService::class.java)
-                                    .setAction(PlaybackService.ACTION_SET_USB_DAC_PASSTHROUGH)
-                                    .putExtra(PlaybackService.EXTRA_USB_DAC_PASSTHROUGH, enabled)
-                            )
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    usbDacPassthrough = !usbDacPassthrough
-                    preferences.edit { putBoolean("usb_dac_passthrough", usbDacPassthrough) }
-                    context.startService(
-                        Intent(context, PlaybackService::class.java)
-                            .setAction(PlaybackService.ACTION_SET_USB_DAC_PASSTHROUGH)
-                            .putExtra(PlaybackService.EXTRA_USB_DAC_PASSTHROUGH, usbDacPassthrough)
-                    )
-                }
-            )
         }
     }
 }
@@ -1958,8 +2125,6 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
     var virtualizer by remember { mutableIntStateOf(preferences.getInt("virtualizer", 0).coerceIn(0, 1000)) }
     var selectedPreset by remember { mutableStateOf(preferences.getString("equalizer_preset_name", "自定义") ?: "自定义") }
     var presetMenuExpanded by remember { mutableStateOf(false) }
-    val usbDacPassthrough = preferences.getBoolean("usb_dac_passthrough", false)
-
     val applyScope = rememberCoroutineScope()
     var pendingApplyJob by remember { mutableStateOf<Job?>(null) }
 
@@ -2069,20 +2234,11 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
                 }
             )
 
-            if (usbDacPassthrough) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "当前已开启 USB DAC 直通，均衡器不会生效。请到「播放设置」关闭直通后再试。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error
-                )
-            } else {
-                Text(
-                    "10 段参数均衡 + 前置增益 + 低音增强 + 环绕声场。调节后立即作用于当前播放。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            Text(
+                "10 段参数均衡 + 前置增益 + 低音增强 + 环绕声场。调节后立即作用于当前播放。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             Spacer(Modifier.height(12.dp))
             Text("频率响应", style = MaterialTheme.typography.titleMedium, color = primary)
@@ -2943,6 +3099,8 @@ fun FullPlayerScreen(
     onNext: () -> Unit,
     onPrevious: () -> Unit,
     onBack: () -> Unit,
+    onExitFullscreenMode: () -> Unit,
+    fullscreenPlayerMode: Boolean,
     context: android.content.Context,
     musicDirectories: List<Uri>,
     songs: List<Song>,
@@ -2972,7 +3130,7 @@ fun FullPlayerScreen(
     LaunchedEffect(isDjMode, isPlaying, isDragging) {
         while (isDjMode && isPlaying && !isDragging) {
             turntableRotation = (turntableRotation + 1.8f) % 360f
-            delay(16.milliseconds)
+            delay(SmoothAnimationFrameRate.frameDelayMillis)
         }
     }
 
@@ -2993,7 +3151,11 @@ fun FullPlayerScreen(
         spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
     }
     val beatEnergy = rememberBeatEnergy(isPlaying = isPlaying, enabled = artworkBeatEnabled)
-    val beatScale = beatScaleFromEnergy(beatEnergy)
+    val beatScale by animateFloatAsState(
+        targetValue = beatScaleFromEnergy(beatEnergy),
+        animationSpec = tween(durationMillis = 100),
+        label = "ArtworkBeatScale"
+    )
     // 按需加载音频格式信息（采样率/比特率），不阻塞主线程
     val audioFormat = remember(song.uri) {
         mutableStateOf<AudioFormatInfo?>(null)
@@ -3087,8 +3249,18 @@ fun FullPlayerScreen(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Row(Modifier.fillMaxWidth()) {
-                            IconButton(onClick = onBack) {
-                                Icon(Icons.Default.KeyboardArrowDown, "返回", Modifier.size(30.dp))
+                            IconButton(
+                                onClick = if (fullscreenPlayerMode) onExitFullscreenMode else onBack
+                            ) {
+                                Icon(
+                                    imageVector = if (fullscreenPlayerMode) {
+                                        Icons.Default.FullscreenExit
+                                    } else {
+                                        Icons.Default.KeyboardArrowDown
+                                    },
+                                    contentDescription = if (fullscreenPlayerMode) "退出全屏模式" else "返回",
+                                    modifier = Modifier.size(30.dp)
+                                )
                             }
                         }
                         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -3183,7 +3355,19 @@ fun FullPlayerScreen(
         Column(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(pagePadding), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
             // 顶部：仅返回按钮
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) { Icon(Icons.Default.KeyboardArrowDown, "返回", Modifier.size(32.dp)) }
+                IconButton(
+                    onClick = if (fullscreenPlayerMode) onExitFullscreenMode else onBack
+                ) {
+                    Icon(
+                        imageVector = if (fullscreenPlayerMode) {
+                            Icons.Default.FullscreenExit
+                        } else {
+                            Icons.Default.KeyboardArrowDown
+                        },
+                        contentDescription = if (fullscreenPlayerMode) "退出全屏模式" else "返回",
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
             }
             // 中部：歌词/专辑，带切换动画
             Box(Modifier.weight(1f).fillMaxWidth(), Alignment.Center) {

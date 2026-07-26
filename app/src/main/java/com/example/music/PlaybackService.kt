@@ -29,20 +29,17 @@ class PlaybackService : MediaSessionService() {
     private var preampDb = 0
     private var bassBoostStrength = 0
     private var virtualizerStrength = 0
-    private var usbDacPassthrough = false
     private lateinit var httpFactory: DefaultHttpDataSource.Factory
 
     companion object {
         private const val TAG = "PlaybackService"
         const val ACTION_APPLY_EQUALIZER = "com.example.music.APPLY_EQUALIZER"
-        const val ACTION_SET_USB_DAC_PASSTHROUGH = "com.example.music.SET_USB_DAC_PASSTHROUGH"
         const val ACTION_REFRESH_WEBDAV_AUTH = "com.example.music.REFRESH_WEBDAV_AUTH"
         const val EXTRA_GAINS = "gains"
         const val EXTRA_EQ_ENABLED = "eq_enabled"
         const val EXTRA_PREAMP = "preamp"
         const val EXTRA_BASS_BOOST = "bass_boost"
         const val EXTRA_VIRTUALIZER = "virtualizer"
-        const val EXTRA_USB_DAC_PASSTHROUGH = "usb_dac_passthrough"
         /** UI 10 段中心频率（Hz） */
         val EQUALIZER_FREQUENCIES = intArrayOf(31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000)
     }
@@ -67,7 +64,6 @@ class PlaybackService : MediaSessionService() {
 
         val prefs = getSharedPreferences("music_prefs", MODE_PRIVATE)
         loadFxFromPrefs(prefs)
-        usbDacPassthrough = prefs.getBoolean("usb_dac_passthrough", false)
 
         player.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -102,18 +98,6 @@ class PlaybackService : MediaSessionService() {
 
         when (intent?.action) {
             ACTION_REFRESH_WEBDAV_AUTH -> updateWebDavHeaders()
-            ACTION_SET_USB_DAC_PASSTHROUGH -> {
-                usbDacPassthrough = intent.getBooleanExtra(EXTRA_USB_DAC_PASSTHROUGH, false)
-                getSharedPreferences("music_prefs", MODE_PRIVATE)
-                    .edit()
-                    .putBoolean("usb_dac_passthrough", usbDacPassthrough)
-                    .apply()
-                if (usbDacPassthrough) {
-                    releaseEffects()
-                } else {
-                    attachEffects(sessionId, forceRebind = true)
-                }
-            }
             ACTION_APPLY_EQUALIZER -> {
                 intent.getIntArrayExtra(EXTRA_GAINS)?.let { pendingGains = it }
                 if (intent.hasExtra(EXTRA_EQ_ENABLED)) {
@@ -129,12 +113,8 @@ class PlaybackService : MediaSessionService() {
                     virtualizerStrength = intent.getIntExtra(EXTRA_VIRTUALIZER, 0).coerceIn(0, 1000)
                 }
                 persistFxPrefs()
-                if (usbDacPassthrough) {
-                    Log.i(TAG, "Skip FX apply: USB DAC passthrough enabled")
-                } else {
-                    attachEffects(sessionId, forceRebind = equalizer == null)
-                    applyAllEffects()
-                }
+                attachEffects(sessionId, forceRebind = equalizer == null)
+                applyAllEffects()
             }
             LyricsWidgetProvider.ACTION_TOGGLE_PLAY -> {
                 player?.let { if (it.isPlaying) it.pause() else it.play() }
@@ -172,10 +152,6 @@ class PlaybackService : MediaSessionService() {
     private fun attachEffects(audioSessionId: Int, forceRebind: Boolean) {
         if (audioSessionId > 0) {
             AudioSessionHolder.sessionId = audioSessionId
-        }
-        if (usbDacPassthrough) {
-            releaseEffects()
-            return
         }
         if (audioSessionId <= 0) {
             Log.w(TAG, "Skip FX attach: invalid sessionId=$audioSessionId")

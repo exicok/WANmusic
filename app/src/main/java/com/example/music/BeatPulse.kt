@@ -100,7 +100,7 @@ fun rememberBeatEnergy(
             } else {
                 energy * 0.8f + pulse * 0.2f
             }
-            delay(16)
+            delay(SmoothAnimationFrameRate.frameDelayMillis)
         }
     }
 

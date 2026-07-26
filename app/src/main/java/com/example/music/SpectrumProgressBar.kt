@@ -129,7 +129,7 @@ fun rememberSpectrumBars(
                 if (raw > prev) prev * 0.3f + raw * 0.7f else prev * 0.75f + raw * 0.25f
             }
             bars = blended
-            delay(16)
+            delay(SmoothAnimationFrameRate.frameDelayMillis)
         }
     }
 
