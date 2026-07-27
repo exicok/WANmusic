@@ -24,5 +24,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "music"
+rootProject.name = "WANmusic"
 include(":app")

@@ -7,6 +7,7 @@ import android.media.audiofx.Virtualizer
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -14,6 +15,13 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.roundToInt
 
@@ -30,6 +38,9 @@ class PlaybackService : MediaSessionService() {
     private var bassBoostStrength = 0
     private var virtualizerStrength = 0
     private lateinit var httpFactory: DefaultHttpDataSource.Factory
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var lastCarLyricLine = ""
+    private var lastCarLyricsRevision = -1L
 
     companion object {
         private const val TAG = "PlaybackService"
@@ -58,7 +69,8 @@ class PlaybackService : MediaSessionService() {
 
         val player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
-            .setAudioAttributes(audioAttributes, /* handleAudioFocus= */ true)
+            // 不申请独占音频焦点，允许与导航、车机及其它音乐应用同时播放。
+            .setAudioAttributes(audioAttributes, /* handleAudioFocus= */ false)
             .setHandleAudioBecomingNoisy(true)
             .build()
 
@@ -90,6 +102,7 @@ class PlaybackService : MediaSessionService() {
         mediaSession = MediaSession.Builder(this, player).build()
         AudioSessionHolder.sessionId = player.audioSessionId
         attachEffects(player.audioSessionId, forceRebind = true)
+        startCarLyricsBridge(player)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -128,6 +141,78 @@ class PlaybackService : MediaSessionService() {
     private fun updateWebDavHeaders() {
         val auth = WebDavRepository.authorization(WebDavRepository.load(this))
         httpFactory.setDefaultRequestProperties(if (auth == null) emptyMap() else mapOf("Authorization" to auth))
+    }
+
+    /**
+     * 将当前歌词行写入 MediaSession 元数据。Android Auto/AAOS/蓝牙车机可在媒体卡片上显示。
+     * 服务后台播放时继续刷新，不依赖播放页保持前台。
+     */
+    private fun startCarLyricsBridge(player: ExoPlayer) {
+        serviceScope.launch {
+            while (isActive) {
+                if (getSharedPreferences("music_prefs", MODE_PRIVATE)
+                        .getBoolean("car_lyrics_enabled", true)
+                ) {
+                    LyricsStateHolder.updatePlaybackClock(
+                        position = player.currentPosition.coerceAtLeast(0L),
+                        playing = player.isPlaying,
+                        duration = player.duration.takeIf { it > 0L }
+                    )
+                    val line = LyricsStateHolder.currentLyricLine()
+                    val revision = LyricsStateHolder.carLyricsRevision()
+                    val currentItem = player.currentMediaItem
+                    if ((line != lastCarLyricLine || revision != lastCarLyricsRevision) &&
+                        currentItem != null &&
+                        player.currentMediaItemIndex >= 0
+                    ) {
+                        val currentMetadata = player.mediaMetadata
+                        val title = LyricsStateHolder.currentSongTitle()
+                            .ifBlank { currentMetadata.title?.toString().orEmpty() }
+                        val artist = LyricsStateHolder.currentSongArtist()
+                            .ifBlank { currentMetadata.artist?.toString().orEmpty() }
+                        val carMetadata = currentMetadata.buildUpon()
+                                .setTitle(title)
+                                // AVRCP 老车机通常只读取标题/歌手两行，将歌词放在第二行。
+                                .setArtist(line.ifBlank { artist })
+                                .setAlbumArtist(artist)
+                                .setSubtitle(line.ifBlank { artist })
+                                .setDescription(line.takeIf { it.isNotBlank() })
+                                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                                .build()
+                        player.replaceMediaItem(
+                            player.currentMediaItemIndex,
+                            currentItem.buildUpon()
+                                .setMediaMetadata(carMetadata)
+                                .build()
+                        )
+                        lastCarLyricLine = line
+                        lastCarLyricsRevision = revision
+                    }
+                } else if (lastCarLyricLine.isNotEmpty()) {
+                    val currentItem = player.currentMediaItem
+                    if (currentItem != null && player.currentMediaItemIndex >= 0) {
+                        val metadata = player.mediaMetadata
+                        val artist = LyricsStateHolder.currentSongArtist()
+                            .ifBlank { metadata.artist?.toString().orEmpty() }
+                        player.replaceMediaItem(
+                            player.currentMediaItemIndex,
+                            currentItem.buildUpon()
+                                .setMediaMetadata(
+                                    metadata.buildUpon()
+                                        .setArtist(artist)
+                                        .setAlbumArtist(artist)
+                                        .setSubtitle(artist)
+                                        .setDescription(null)
+                                        .build()
+                                )
+                                .build()
+                        )
+                    }
+                    lastCarLyricLine = ""
+                }
+                delay(250L)
+            }
+        }
     }
 
     private fun loadFxFromPrefs(prefs: android.content.SharedPreferences) {
@@ -336,6 +421,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         AudioSessionHolder.sessionId = 0
+        serviceScope.cancel()
         releaseEffects()
         mediaSession?.run {
             player.release()

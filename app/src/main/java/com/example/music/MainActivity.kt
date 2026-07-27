@@ -607,18 +607,6 @@ data class Song(
     val artwork: Bitmap? = null
 )
 
-sealed class Screen {
-    object Settings : Screen()
-    object Library : Screen()
-    object WebDav : Screen()
-    object Data : Screen()
-    object Playback : Screen()
-    object AudioCodecs : Screen()
-    object Equalizer : Screen()
-    object LocalMusic : Screen()
-    object PlayerView : Screen()
-}
-
 @Composable
 private fun StartupErrorScreen(message: String) {
     Column(
@@ -962,7 +950,8 @@ fun MusicApp(
             activity?.moveTaskToBack(true)
         } else {
             currentScreen = when (currentScreen) {
-                Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs -> Screen.Settings
+                Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs,
+                Screen.AboutSupport -> Screen.Settings
                 Screen.Equalizer -> Screen.LocalMusic
                 Screen.WebDav -> Screen.Settings
                 Screen.LocalMusic -> Screen.LocalMusic
@@ -1242,6 +1231,9 @@ fun MusicApp(
                             onBack = { currentScreen = Screen.Settings }
                         )
                         Screen.AudioCodecs -> AudioCodecSupportScreen(
+                            onBack = { currentScreen = Screen.Settings }
+                        )
+                        Screen.AboutSupport -> AboutSupportScreen(
                             onBack = { currentScreen = Screen.Settings }
                         )
                         Screen.Equalizer -> EqualizerSettingsScreen(
@@ -1583,6 +1575,8 @@ fun SettingsMenu(
             SettingsItem("WebDAV 音乐源", Icons.Default.CloudQueue) { onNavigate(Screen.WebDav) }
             SettingsSectionHeader("数据管理")
             SettingsItem("数据", Icons.Default.Storage) { onNavigate(Screen.Data) }
+            SettingsSectionHeader("关于")
+            SettingsItem("关于与支持", Icons.Default.Info) { onNavigate(Screen.AboutSupport) }
         }
     }
 }
@@ -1854,6 +1848,9 @@ fun PlaybackSettingsScreen(
     var overlayEnabled by remember {
         mutableStateOf(OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning())
     }
+    var carLyricsEnabled by remember {
+        mutableStateOf(preferences.getBoolean("car_lyrics_enabled", true))
+    }
     val canDrawOverlays = remember {
         mutableStateOf(android.provider.Settings.canDrawOverlays(context))
     }
@@ -1969,6 +1966,26 @@ fun PlaybackSettingsScreen(
                     )
                 },
                 modifier = Modifier.clickable { setOverlayLyrics(!overlayEnabled) }
+            )
+            ListItem(
+                headlineContent = { Text("车载歌词") },
+                supportingContent = {
+                    Text("在 Android Auto、车载媒体卡片和支持媒体元数据的蓝牙车机上显示当前歌词")
+                },
+                leadingContent = { Icon(Icons.Default.DirectionsCar, null) },
+                trailingContent = {
+                    Switch(
+                        checked = carLyricsEnabled,
+                        onCheckedChange = {
+                            carLyricsEnabled = it
+                            preferences.edit { putBoolean("car_lyrics_enabled", it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    carLyricsEnabled = !carLyricsEnabled
+                    preferences.edit { putBoolean("car_lyrics_enabled", carLyricsEnabled) }
+                }
             )
             var artworkBeatEnabled by remember {
                 mutableStateOf(preferences.getBoolean("artwork_beat_enabled", true))

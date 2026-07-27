@@ -41,6 +41,10 @@ object LyricsStateHolder {
     private var lastPublishedTitle: String = ""
     private var lastPublishedArtist: String = ""
     private var lastPublishedPlaying: Boolean? = null
+    @Volatile
+    private var carLyricsRevision: Long = 0L
+
+    fun carLyricsRevision(): Long = carLyricsRevision
 
     fun currentLyricLine(): String = resolveLineProgress()?.line.orEmpty()
 
@@ -159,6 +163,7 @@ object LyricsStateHolder {
             lastPublishedTitle = title
             lastPublishedArtist = artist
             lastPublishedPlaying = playing
+            carLyricsRevision++
             LyricsWidgetProvider.updateAllWidgets(context.applicationContext)
         }
     }
@@ -182,6 +187,7 @@ object LyricsStateHolder {
         lastPublishedTitle = ""
         lastPublishedArtist = ""
         lastPublishedPlaying = null
+        carLyricsRevision++
         context?.applicationContext?.let { LyricsWidgetProvider.updateAllWidgets(it) }
     }
 }

@@ -27,6 +27,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Music"
         android:enableOnBackInvokedCallback="true">
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
