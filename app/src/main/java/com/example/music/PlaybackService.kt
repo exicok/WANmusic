@@ -102,7 +102,7 @@ class PlaybackService : MediaSessionService() {
         mediaSession = MediaSession.Builder(this, player).build()
         AudioSessionHolder.sessionId = player.audioSessionId
         attachEffects(player.audioSessionId, forceRebind = true)
-        startCarLyricsBridge(player)
+        startLyricsBridge(player)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -147,17 +147,18 @@ class PlaybackService : MediaSessionService() {
      * 将当前歌词行写入 MediaSession 元数据。Android Auto/AAOS/蓝牙车机可在媒体卡片上显示。
      * 服务后台播放时继续刷新，不依赖播放页保持前台。
      */
-    private fun startCarLyricsBridge(player: ExoPlayer) {
+    private fun startLyricsBridge(player: ExoPlayer) {
         serviceScope.launch {
             while (isActive) {
+                LyricsStateHolder.updatePlaybackClock(
+                    position = player.currentPosition.coerceAtLeast(0L),
+                    playing = player.isPlaying,
+                    duration = player.duration.takeIf { it > 0L }
+                )
+                LyricsInteropPublisher.publish(this@PlaybackService)
                 if (getSharedPreferences("music_prefs", MODE_PRIVATE)
                         .getBoolean("car_lyrics_enabled", true)
                 ) {
-                    LyricsStateHolder.updatePlaybackClock(
-                        position = player.currentPosition.coerceAtLeast(0L),
-                        playing = player.isPlaying,
-                        duration = player.duration.takeIf { it > 0L }
-                    )
                     val line = LyricsStateHolder.currentLyricLine()
                     val revision = LyricsStateHolder.carLyricsRevision()
                     val currentItem = player.currentMediaItem

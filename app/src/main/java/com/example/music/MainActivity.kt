@@ -1851,6 +1851,9 @@ fun PlaybackSettingsScreen(
     var carLyricsEnabled by remember {
         mutableStateOf(preferences.getBoolean("car_lyrics_enabled", true))
     }
+    var lyricsProviderEnabled by remember {
+        mutableStateOf(preferences.getBoolean("lyrics_provider_enabled", true))
+    }
     val canDrawOverlays = remember {
         mutableStateOf(android.provider.Settings.canDrawOverlays(context))
     }
@@ -1889,6 +1892,13 @@ fun PlaybackSettingsScreen(
             OverlayLyricsService.stop(context)
             overlayEnabled = false
         }
+    }
+    fun setLyricsProviderEnabled(enabled: Boolean) {
+        lyricsProviderEnabled = enabled
+        preferences.edit { putBoolean("lyrics_provider_enabled", enabled) }
+        if (enabled) LyricsInteropPublisher.publish(context, force = true)
+        context.contentResolver.notifyChange(LyricsProviderContract.STATE_URI, null)
+        context.contentResolver.notifyChange(LyricsProviderContract.LYRICS_URI, null)
     }
     Scaffold(
         topBar = {
@@ -1985,6 +1995,22 @@ fun PlaybackSettingsScreen(
                 modifier = Modifier.clickable {
                     carLyricsEnabled = !carLyricsEnabled
                     preferences.edit { putBoolean("car_lyrics_enabled", carLyricsEnabled) }
+                }
+            )
+            ListItem(
+                headlineContent = { Text("通用歌词提供服务") },
+                supportingContent = {
+                    Text("向歌词软件发送歌曲、播放位置、逐字进度，并提供完整歌词查询接口")
+                },
+                leadingContent = { Icon(Icons.Default.SyncAlt, null) },
+                trailingContent = {
+                    Switch(
+                        checked = lyricsProviderEnabled,
+                        onCheckedChange = ::setLyricsProviderEnabled
+                    )
+                },
+                modifier = Modifier.clickable {
+                    setLyricsProviderEnabled(!lyricsProviderEnabled)
                 }
             )
             var artworkBeatEnabled by remember {

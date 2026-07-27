@@ -12,6 +12,17 @@ import android.text.style.ForegroundColorSpan
  * 供桌面歌词部件、悬浮歌词服务读取。
  */
 object LyricsStateHolder {
+    data class StateSnapshot(
+        val title: String,
+        val artist: String,
+        val songUri: String,
+        val position: Long,
+        val duration: Long,
+        val isPlaying: Boolean,
+        val lyrics: List<Pair<Long, String>>,
+        val lineProgress: LineProgress?
+    )
+
     data class LineProgress(
         val title: String,
         val artist: String,
@@ -50,6 +61,21 @@ object LyricsStateHolder {
 
     fun currentSongTitle(): String = currentSong?.title.orEmpty()
     fun currentSongArtist(): String = currentSong?.artist.orEmpty()
+
+    @Synchronized
+    fun snapshot(): StateSnapshot {
+        val position = effectivePosition()
+        return StateSnapshot(
+            title = currentSongTitle(),
+            artist = currentSongArtist(),
+            songUri = currentSong?.uri?.toString().orEmpty(),
+            position = position,
+            duration = duration,
+            isPlaying = isPlaying,
+            lyrics = lyrics.toList(),
+            lineProgress = resolveLineProgress(position)
+        )
+    }
 
     /**
      * 有效播放进度：前台由主界面驱动；后台若仍在播放则按墙上时钟外推。
@@ -166,6 +192,7 @@ object LyricsStateHolder {
             carLyricsRevision++
             LyricsWidgetProvider.updateAllWidgets(context.applicationContext)
         }
+        LyricsInteropPublisher.publish(context)
     }
 
     /** 悬浮歌词/部件可直接回写播放器真实进度，减少外推误差。 */

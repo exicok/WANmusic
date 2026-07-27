@@ -64,6 +64,12 @@
                 android:value="Displays floating desktop lyrics over other apps while music is playing" />
         </service>
 
+        <provider
+            android:name=".LyricsContentProvider"
+            android:authorities="com.example.music.lyrics"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
         <receiver
             android:name=".LyricsWidgetProvider"
             android:exported="true"
