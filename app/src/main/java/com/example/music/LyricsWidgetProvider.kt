@@ -15,7 +15,6 @@ import android.widget.RemoteViews
 class LyricsWidgetProvider : AppWidgetProvider() {
 
     companion object {
-        const val ACTION_UPDATE_LYRICS = "com.example.music.UPDATE_WIDGET_LYRICS"
         const val ACTION_TOGGLE_PLAY = "com.example.music.WIDGET_TOGGLE_PLAY"
         const val ACTION_NEXT = "com.example.music.WIDGET_NEXT"
         const val ACTION_PREV = "com.example.music.WIDGET_PREV"
@@ -28,11 +27,7 @@ class LyricsWidgetProvider : AppWidgetProvider() {
                 ComponentName(context, LyricsWidgetProvider::class.java)
             )
             if (ids.isEmpty()) return
-            val intent = Intent(context, LyricsWidgetProvider::class.java).apply {
-                action = AppWidgetManager.ACTION_APPWIDGET_UPDATE
-                putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids)
-            }
-            context.sendBroadcast(intent)
+            LyricsWidgetProvider().onUpdate(context, manager, ids)
         }
     }
 
@@ -48,7 +43,7 @@ class LyricsWidgetProvider : AppWidgetProvider() {
 
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
-            ACTION_UPDATE_LYRICS, AppWidgetManager.ACTION_APPWIDGET_UPDATE -> {
+            AppWidgetManager.ACTION_APPWIDGET_UPDATE -> {
                 val manager = AppWidgetManager.getInstance(context)
                 val ids = intent.getIntArrayExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS)
                     ?: manager.getAppWidgetIds(ComponentName(context, LyricsWidgetProvider::class.java))

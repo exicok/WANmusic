@@ -1,0 +1,5 @@
+# ninja log v5
+0	2808	8070404386359111	CMakeFiles/wan_audio_output.dir/native_audio_output.cpp.o	be5748846a4de602
+2818	3485	8070404388040602	E:/DProject/WANmusic/app/build/intermediates/cxx/Debug/1m135p4j/obj/arm64-v8a/libwan_audio_output.so	3c6f49cc806ef678
+5	2259	8070411147827626	CMakeFiles/wan_audio_output.dir/native_audio_output.cpp.o	be5748846a4de602
+2259	2473	8070411149835597	E:/DProject/WANmusic/app/build/intermediates/cxx/Debug/1m135p4j/obj/arm64-v8a/libwan_audio_output.so	3c6f49cc806ef678

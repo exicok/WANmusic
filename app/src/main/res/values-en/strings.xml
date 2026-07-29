@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">WANmusic</string>
+    <string name="widget_lyrics_name">Desktop Lyrics</string>
+    <string name="widget_lyrics_description">Shows album artwork, current track, live lyrics, and playback controls</string>
+    <string name="widget_idle_title">WANmusic</string>
+    <string name="widget_idle_lyric">Nothing playing</string>
+    <string name="widget_no_lyric">No lyrics</string>
+    <string name="widget_prev">Previous</string>
+    <string name="widget_play">Play/Pause</string>
+    <string name="widget_next">Next</string>
+    <string name="overlay_channel_name">Floating Lyrics</string>
+    <string name="overlay_channel_desc">Floating lyrics service notification</string>
+    <string name="overlay_notification_title">Floating Lyrics</string>
+    <string name="overlay_notification_text">Floating lyrics are visible and can be dragged</string>
+    <string name="overlay_action_close">Close</string>
+    <string name="overlay_idle_title">WANmusic</string>
+    <string name="overlay_idle_lyric">Waiting for playback...</string>
+    <string name="widget_artwork">Album artwork</string>
+</resources>

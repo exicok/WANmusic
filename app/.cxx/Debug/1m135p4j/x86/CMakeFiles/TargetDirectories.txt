@@ -1,0 +1,3 @@
+E:/DProject/WANmusic/app/.cxx/Debug/1m135p4j/x86/CMakeFiles/wan_audio_output.dir
+E:/DProject/WANmusic/app/.cxx/Debug/1m135p4j/x86/CMakeFiles/edit_cache.dir
+E:/DProject/WANmusic/app/.cxx/Debug/1m135p4j/x86/CMakeFiles/rebuild_cache.dir

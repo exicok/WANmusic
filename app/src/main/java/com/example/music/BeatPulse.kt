@@ -28,14 +28,15 @@ fun rememberBeatEnergy(
     isPlaying: Boolean,
     enabled: Boolean = true
 ): Float {
+    val effectiveEnabled = enabled && AppAnimationSettings.enabled
     var energy by remember { mutableFloatStateOf(0f) }
     var sessionId by remember { mutableIntStateOf(AudioSessionHolder.sessionId) }
     var useVisualizer by remember { mutableStateOf(false) }
     var smoothed by remember { mutableFloatStateOf(0f) }
 
     // 轮询会话 ID（播放服务异步挂载）
-    LaunchedEffect(isPlaying, enabled) {
-        while (enabled) {
+    LaunchedEffect(isPlaying, effectiveEnabled) {
+        while (effectiveEnabled) {
             val id = AudioSessionHolder.sessionId
             if (id != sessionId) {
                 sessionId = id
@@ -45,8 +46,8 @@ fun rememberBeatEnergy(
         }
     }
 
-    DisposableEffect(enabled) {
-        if (!enabled) {
+    DisposableEffect(effectiveEnabled) {
+        if (!effectiveEnabled) {
             energy = 0f
             useVisualizer = false
             onDispose { }
@@ -72,8 +73,8 @@ fun rememberBeatEnergy(
     }
 
     // 合成节拍兜底 / 未播放时归零
-    LaunchedEffect(isPlaying, enabled, useVisualizer, sessionId) {
-        if (!enabled) {
+    LaunchedEffect(isPlaying, effectiveEnabled, useVisualizer, sessionId) {
+        if (!effectiveEnabled) {
             energy = 0f
             return@LaunchedEffect
         }
@@ -100,11 +101,11 @@ fun rememberBeatEnergy(
             } else {
                 energy * 0.8f + pulse * 0.2f
             }
-            delay(SmoothAnimationFrameRate.frameDelayMillis)
+            delay(16L)
         }
     }
 
-    return if (enabled) energy else 0f
+    return if (effectiveEnabled) energy else 0f
 }
 
 /** 根据能量计算封面缩放倍数（1f 为静止）。 */

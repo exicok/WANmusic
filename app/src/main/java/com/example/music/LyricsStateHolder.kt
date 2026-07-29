@@ -192,7 +192,7 @@ object LyricsStateHolder {
             carLyricsRevision++
             LyricsWidgetProvider.updateAllWidgets(context.applicationContext)
         }
-        LyricsInteropPublisher.publish(context)
+        LyricsProviderNotifier.notifyChanged(context)
     }
 
     /** 悬浮歌词/部件可直接回写播放器真实进度，减少外推误差。 */

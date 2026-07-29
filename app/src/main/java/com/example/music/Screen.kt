@@ -6,9 +6,20 @@ sealed class Screen {
     data object WebDav : Screen()
     data object Data : Screen()
     data object Playback : Screen()
+    data object AudioOutput : Screen()
+    data object LyricsAndDevices : Screen()
     data object AudioCodecs : Screen()
     data object AboutSupport : Screen()
     data object Equalizer : Screen()
     data object LocalMusic : Screen()
     data object PlayerView : Screen()
+
+    fun backDestination(): Screen? = when (this) {
+        LocalMusic -> null
+        PlayerView -> LocalMusic
+        Equalizer -> LocalMusic
+        Settings -> LocalMusic
+        Library, WebDav, Data, Playback, AudioOutput, LyricsAndDevices, AudioCodecs,
+        AboutSupport -> Settings
+    }
 }

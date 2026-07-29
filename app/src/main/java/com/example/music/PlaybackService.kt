@@ -1,6 +1,7 @@
 package com.example.music
 
 import android.content.Intent
+import android.media.AudioManager
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
 import android.media.audiofx.Virtualizer
@@ -9,6 +10,7 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -21,12 +23,16 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.roundToInt
 
+@OptIn(UnstableApi::class)
 class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private var activePlayer: ExoPlayer? = null
+    private var sessionPlayer: FadePlaybackPlayer? = null
     private var equalizer: Equalizer? = null
     private var bassBoost: BassBoost? = null
     private var virtualizer: Virtualizer? = null
@@ -38,19 +44,25 @@ class PlaybackService : MediaSessionService() {
     private var bassBoostStrength = 0
     private var virtualizerStrength = 0
     private lateinit var httpFactory: DefaultHttpDataSource.Factory
+    private lateinit var dataSourceFactory: DefaultDataSource.Factory
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var lyricsBridgeJob: Job? = null
+    private var audioOutputRebuildJob: Job? = null
     private var lastCarLyricLine = ""
     private var lastCarLyricsRevision = -1L
 
     companion object {
         private const val TAG = "PlaybackService"
         const val ACTION_APPLY_EQUALIZER = "com.example.music.APPLY_EQUALIZER"
+        const val ACTION_APPLY_AUDIO_OUTPUT = "com.example.music.APPLY_AUDIO_OUTPUT"
+        const val ACTION_SET_AUDIO_GAIN = "com.example.music.SET_AUDIO_GAIN"
         const val ACTION_REFRESH_WEBDAV_AUTH = "com.example.music.REFRESH_WEBDAV_AUTH"
         const val EXTRA_GAINS = "gains"
         const val EXTRA_EQ_ENABLED = "eq_enabled"
         const val EXTRA_PREAMP = "preamp"
         const val EXTRA_BASS_BOOST = "bass_boost"
         const val EXTRA_VIRTUALIZER = "virtualizer"
+        const val EXTRA_AUDIO_GAIN_DB = "audio_gain_db"
         /** UI 10 段中心频率（Hz） */
         val EQUALIZER_FREQUENCIES = intArrayOf(31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000)
     }
@@ -59,24 +71,50 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         httpFactory = DefaultHttpDataSource.Factory()
         updateWebDavHeaders()
-        val dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
-
-        // 使用标准渲染管线，保证 Equalizer 可挂到播放会话
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(C.USAGE_MEDIA)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-            .build()
-
-        val player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
-            // 不申请独占音频焦点，允许与导航、车机及其它音乐应用同时播放。
-            .setAudioAttributes(audioAttributes, /* handleAudioFocus= */ false)
-            .setHandleAudioBecomingNoisy(true)
-            .build()
+        dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
+        val player = createPlayer()
+        val forwardingPlayer = createSessionPlayer(player)
 
         val prefs = getSharedPreferences("music_prefs", MODE_PRIVATE)
         loadFxFromPrefs(prefs)
 
+        activePlayer = player
+        sessionPlayer = forwardingPlayer
+        mediaSession = MediaSession.Builder(this, forwardingPlayer).build()
+        AudioSessionHolder.sessionId = player.audioSessionId
+        attachEffects(player.audioSessionId, forceRebind = true)
+        startLyricsBridge(player)
+    }
+
+    private fun createPlayer(): ExoPlayer {
+        val outputConfig = AudioOutputConfig.load(this)
+        AudioOutputRuntime.setGainDb(outputConfig.gainDb)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .build()
+        val player = ExoPlayer.Builder(
+            this,
+            AudioOutputRenderersFactory(this, outputConfig),
+            DefaultMediaSourceFactory(dataSourceFactory)
+        )
+            .setAudioAttributes(audioAttributes, /* handleAudioFocus= */ false)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+        val generatedSessionId = (getSystemService(AUDIO_SERVICE) as AudioManager)
+            .generateAudioSessionId()
+        if (generatedSessionId > 0) player.setAudioSessionId(generatedSessionId)
+        attachPlayerListeners(player)
+        return player
+    }
+
+    private fun createSessionPlayer(player: ExoPlayer): FadePlaybackPlayer = FadePlaybackPlayer(
+        delegate = player,
+        scope = serviceScope,
+        configProvider = { AudioOutputConfig.load(this) }
+    )
+
+    private fun attachPlayerListeners(player: ExoPlayer) {
         player.addListener(object : Player.Listener {
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
                 AudioSessionHolder.sessionId = audioSessionId
@@ -98,19 +136,77 @@ class PlaybackService : MediaSessionService() {
                 }
             }
         })
+    }
 
-        mediaSession = MediaSession.Builder(this, player).build()
-        AudioSessionHolder.sessionId = player.audioSessionId
-        attachEffects(player.audioSessionId, forceRebind = true)
-        startLyricsBridge(player)
+    private fun rebuildPlayerForAudioOutput() {
+        val session = mediaSession ?: return
+        val oldPlayer = activePlayer ?: return
+        val oldSessionPlayer = sessionPlayer
+        val mediaItems = List(oldPlayer.mediaItemCount) { oldPlayer.getMediaItemAt(it) }
+        val currentIndex = oldPlayer.currentMediaItemIndex.coerceAtLeast(0)
+        val currentPosition = oldPlayer.currentPosition.coerceAtLeast(0L)
+        val playWhenReady = oldPlayer.playWhenReady
+        val repeatMode = oldPlayer.repeatMode
+        val shuffleModeEnabled = oldPlayer.shuffleModeEnabled
+        val playbackParameters = oldPlayer.playbackParameters
+        val volume = oldSessionPlayer?.volume ?: oldPlayer.volume
+
+        val newPlayer = runCatching { createPlayer() }.getOrElse { error ->
+            Log.e(TAG, "Create configured audio output failed; keeping current player", error)
+            return
+        }.apply {
+            this.repeatMode = repeatMode
+            this.shuffleModeEnabled = shuffleModeEnabled
+            this.playbackParameters = playbackParameters
+            this.volume = volume
+            if (mediaItems.isNotEmpty()) {
+                setMediaItems(
+                    mediaItems,
+                    currentIndex.coerceAtMost(mediaItems.lastIndex),
+                    currentPosition
+                )
+                prepare()
+            }
+        }
+        val newSessionPlayer = createSessionPlayer(newPlayer)
+        runCatching {
+            session.setPlayer(newSessionPlayer)
+        }.onSuccess {
+            lyricsBridgeJob?.cancel()
+            releaseEffects()
+            oldSessionPlayer?.cancelPendingFade()
+            oldPlayer.pause()
+            oldPlayer.release()
+            activePlayer = newPlayer
+            sessionPlayer = newSessionPlayer
+            newSessionPlayer.playWhenReady = playWhenReady
+            AudioSessionHolder.sessionId = newPlayer.audioSessionId
+            attachEffects(newPlayer.audioSessionId, forceRebind = true)
+            startLyricsBridge(newPlayer)
+        }.onFailure { error ->
+            Log.e(TAG, "Switch audio output failed; keeping current player", error)
+            newSessionPlayer.release()
+        }
+    }
+
+    private fun scheduleAudioOutputRebuild() {
+        audioOutputRebuildJob?.cancel()
+        audioOutputRebuildJob = serviceScope.launch {
+            delay(150L)
+            rebuildPlayerForAudioOutput()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val player = mediaSession?.player as? ExoPlayer
-        val sessionId = player?.audioSessionId ?: AudioSessionHolder.sessionId
+        val player = mediaSession?.player
+        val sessionId = activePlayer?.audioSessionId ?: AudioSessionHolder.sessionId
 
         when (intent?.action) {
             ACTION_REFRESH_WEBDAV_AUTH -> updateWebDavHeaders()
+            ACTION_APPLY_AUDIO_OUTPUT -> scheduleAudioOutputRebuild()
+            ACTION_SET_AUDIO_GAIN -> AudioOutputRuntime.setGainDb(
+                intent.getFloatExtra(EXTRA_AUDIO_GAIN_DB, 0f)
+            )
             ACTION_APPLY_EQUALIZER -> {
                 intent.getIntArrayExtra(EXTRA_GAINS)?.let { pendingGains = it }
                 if (intent.hasExtra(EXTRA_EQ_ENABLED)) {
@@ -148,14 +244,15 @@ class PlaybackService : MediaSessionService() {
      * 服务后台播放时继续刷新，不依赖播放页保持前台。
      */
     private fun startLyricsBridge(player: ExoPlayer) {
-        serviceScope.launch {
+        lyricsBridgeJob?.cancel()
+        lyricsBridgeJob = serviceScope.launch {
             while (isActive) {
                 LyricsStateHolder.updatePlaybackClock(
                     position = player.currentPosition.coerceAtLeast(0L),
                     playing = player.isPlaying,
                     duration = player.duration.takeIf { it > 0L }
                 )
-                LyricsInteropPublisher.publish(this@PlaybackService)
+                LyricsProviderNotifier.notifyChanged(this@PlaybackService)
                 if (getSharedPreferences("music_prefs", MODE_PRIVATE)
                         .getBoolean("car_lyrics_enabled", true)
                 ) {
@@ -424,11 +521,11 @@ class PlaybackService : MediaSessionService() {
         AudioSessionHolder.sessionId = 0
         serviceScope.cancel()
         releaseEffects()
-        mediaSession?.run {
-            player.release()
-            release()
-            mediaSession = null
-        }
+        sessionPlayer?.release()
+        sessionPlayer = null
+        activePlayer = null
+        mediaSession?.release()
+        mediaSession = null
         super.onDestroy()
     }
 }

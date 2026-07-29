@@ -10,6 +10,7 @@ import android.media.MediaCodecList
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.util.LruCache
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
@@ -17,23 +18,28 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Path
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -64,6 +70,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -100,6 +107,8 @@ import io.github.proify.lyricon.lyric.model.LyricWord
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.FutureTask
 import kotlin.math.log10
 import kotlin.math.pow
 import kotlin.time.Duration.Companion.milliseconds
@@ -129,7 +138,7 @@ object ConfigManager {
     }
 }
 
-// 扫描记录持久化：保存上次扫描的歌曲列表（封面保存为独立 PNG 文件），
+// 扫描记录持久化：保存上次扫描的歌曲列表（封面保存为独立压缩文件），
 // 应用启动时直接加载，避免每次启动都重新扫描音乐库目录
 // 歌曲列表滚动位置记忆：回到音乐页时恢复上次滑动位置
 object ListScrollMemory {
@@ -160,7 +169,17 @@ object ScanRecordsManager {
     private const val KEY_DURATION = "d"   // Song 类的第三个字段实际存的是文件大小
     private const val KEY_URI = "u"
     private const val KEY_ARTWORK = "w"   // 封面文件 hash（用 URI 哈希做文件名）
+    private const val DEFAULT_ARTWORK_SIZE = 768
+    private val artworkSizeBuckets = intArrayOf(96, 160, 320, DEFAULT_ARTWORK_SIZE)
+    private val missingArtwork = ConcurrentHashMap.newKeySet<String>()
+    private val inFlightLoads = ConcurrentHashMap<String, FutureTask<Bitmap?>>()
+    private val memoryCache = object : LruCache<String, Bitmap>(artworkCacheSizeKb()) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return (value.allocationByteCount / 1024).coerceAtLeast(1)
+        }
+    }
 
+    @Synchronized
     fun save(context: android.content.Context, songs: List<Song>) {
         try {
             val artworkDir = File(context.filesDir, ARTWORK_DIR).apply { mkdirs() }
@@ -173,23 +192,27 @@ object ScanRecordsManager {
                 obj.put(KEY_ARTIST, s.artist)
                 obj.put(KEY_DURATION, s.duration)
                 obj.put(KEY_URI, s.uri.toString())
-                // 封面单独存为 PNG 文件，JSON 中只记录 hash
-                s.artwork?.let { bitmap ->
-                    val hash = s.uri.toString().hashCode().toString(16)
-                    val file = File(artworkDir, "$hash.png")
-                    try {
-                        file.outputStream().use { out ->
-                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                val hash = s.uri.toString().hashCode().toString(16)
+                val artworkFile = File(artworkDir, "$hash.png")
+                if (artworkFile.exists()) {
+                    obj.put(KEY_ARTWORK, hash)
+                } else {
+                    s.artwork?.let { bitmap ->
+                        if (writeArtworkFile(artworkFile, bitmap)) {
+                            obj.put(KEY_ARTWORK, hash)
                         }
-                        obj.put(KEY_ARTWORK, hash)
-                    } catch (e: Exception) {
-                        android.util.Log.w("ScanRecordsManager", "保存封面失败: ${e.message}")
                     }
                 }
                 arr.put(obj)
             }
             root.put(KEY_SONGS, arr)
-            File(context.filesDir, FILE_NAME).writeText(root.toString())
+            val recordsFile = File(context.filesDir, FILE_NAME)
+            val temporaryFile = File(context.filesDir, "$FILE_NAME.tmp")
+            temporaryFile.writeText(root.toString())
+            if (!temporaryFile.renameTo(recordsFile)) {
+                recordsFile.writeText(root.toString())
+                temporaryFile.delete()
+            }
         } catch (e: Exception) {
             android.util.Log.w("ScanRecordsManager", "保存扫描记录失败: ${e.message}")
         }
@@ -223,17 +246,23 @@ object ScanRecordsManager {
         }
     }
 
-    /** 异步加载封面：扫描单张 Bitmap 并赋值给 Song，返回更新后的 Song */
-    fun loadArtworkAsync(context: android.content.Context, song: Song): Song? {
-        if (song.artwork != null) return song
-        val artFile = artworkFile(context, song.uri)
-        if (!artFile.exists()) return null
-        return try {
-            val bitmap = android.graphics.BitmapFactory.decodeFile(artFile.absolutePath)
-            if (bitmap != null) song.copy(artwork = bitmap) else null
-        } catch (e: Exception) {
-            null
-        }
+    fun peekArtwork(song: Song, maxPx: Int = DEFAULT_ARTWORK_SIZE): Bitmap? {
+        val targetSize = artworkSizeBucket(maxPx)
+        val key = artworkCacheKey(song.uri, targetSize)
+        memoryCache.get(key)?.let { return it }
+        val artwork = song.artwork ?: return null
+        if (maxOf(artwork.width, artwork.height) > targetSize) return null
+        memoryCache.put(key, artwork)
+        return artwork
+    }
+
+    /** 后台加载封面并复用同一 URI、同一尺寸的并发请求。 */
+    fun loadArtworkAsync(
+        context: android.content.Context,
+        song: Song,
+        maxPx: Int = DEFAULT_ARTWORK_SIZE
+    ): Song? {
+        return loadArtworkBitmap(context, song, maxPx)?.let { song.copy(artwork = it) }
     }
 
     fun artworkFile(context: android.content.Context, uri: Uri): File {
@@ -247,11 +276,16 @@ object ScanRecordsManager {
         val file = artworkFile(context, song.uri)
         if (file.exists()) return
         val bitmap = song.artwork ?: return
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.outputStream().use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
-            }
+        writeArtworkFile(file, bitmap)
+    }
+
+    fun cacheEmbeddedArtwork(context: Context, uri: Uri, bytes: ByteArray) {
+        val file = artworkFile(context, uri)
+        if (file.exists()) return
+        val bitmap = decodeSampledBitmap(bytes, DEFAULT_ARTWORK_SIZE) ?: return
+        if (writeArtworkFile(file, bitmap)) {
+            missingArtwork.remove(uri.toString())
+            memoryCache.put(artworkCacheKey(uri, DEFAULT_ARTWORK_SIZE), bitmap)
         }
     }
 
@@ -261,22 +295,36 @@ object ScanRecordsManager {
         song: Song,
         maxPx: Int = 256
     ): Bitmap? {
-        ensureArtworkCached(context, song)
+        val targetSize = artworkSizeBucket(maxPx)
+        val cacheKey = artworkCacheKey(song.uri, targetSize)
+        memoryCache.get(cacheKey)?.let { return it }
+        peekArtwork(song, targetSize)?.let { return it }
+
         val file = artworkFile(context, song.uri)
-        val raw = when {
-            file.exists() -> runCatching {
-                decodeSampledBitmap(file.absolutePath, maxPx)
-            }.getOrNull()
-            song.artwork != null -> song.artwork
-            else -> null
-        } ?: return null
-        return if (raw.width <= maxPx && raw.height <= maxPx) {
-            raw
-        } else {
-            val scale = maxPx.toFloat() / maxOf(raw.width, raw.height).toFloat()
-            val w = (raw.width * scale).toInt().coerceAtLeast(1)
-            val h = (raw.height * scale).toInt().coerceAtLeast(1)
-            Bitmap.createScaledBitmap(raw, w, h, true)
+        val uriKey = song.uri.toString()
+        if (uriKey in missingArtwork && song.artwork == null) return null
+        if (!file.exists()) {
+            missingArtwork.add(uriKey)
+            val scaled = song.artwork?.let { scaleBitmap(it, targetSize) } ?: return null
+            memoryCache.put(cacheKey, scaled)
+            return scaled
+        }
+        if (uriKey in missingArtwork) missingArtwork.remove(uriKey)
+
+        val newTask = FutureTask<Bitmap?> {
+            decodeSampledBitmap(file.absolutePath, targetSize)?.let { decoded ->
+                val scaled = scaleBitmap(decoded, targetSize)
+                if (scaled !== decoded) decoded.recycle()
+                scaled
+            }
+        }
+        val task = inFlightLoads.putIfAbsent(cacheKey, newTask) ?: newTask.also { it.run() }
+        return try {
+            task.get()?.also { memoryCache.put(cacheKey, it) }
+        } catch (_: Exception) {
+            null
+        } finally {
+            if (task === newTask) inFlightLoads.remove(cacheKey, newTask)
         }
     }
 
@@ -286,8 +334,64 @@ object ScanRecordsManager {
         var sample = 1
         val largest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
         while (largest / sample > maxPx * 2) sample *= 2
-        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = if (maxPx <= 160) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
+        }
         return android.graphics.BitmapFactory.decodeFile(path, opts)
+    }
+
+    private fun decodeSampledBitmap(bytes: ByteArray, maxPx: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        val largest = maxOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
+        while (largest / sample > maxPx * 2) sample *= 2
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = if (maxPx <= 160) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { decoded ->
+            val scaled = scaleBitmap(decoded, maxPx)
+            if (scaled !== decoded) decoded.recycle()
+            scaled
+        }
+    }
+
+    private fun scaleBitmap(bitmap: Bitmap, maxPx: Int): Bitmap {
+        if (bitmap.width <= maxPx && bitmap.height <= maxPx) return bitmap
+        val scale = maxPx.toFloat() / maxOf(bitmap.width, bitmap.height).toFloat()
+        val width = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val height = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, width, height, true)
+    }
+
+    private fun writeArtworkFile(file: File, bitmap: Bitmap): Boolean = runCatching {
+        file.parentFile?.mkdirs()
+        val temporaryFile = File(file.parentFile, "${file.name}.tmp")
+        temporaryFile.outputStream().buffered().use { output ->
+            check(bitmap.compress(Bitmap.CompressFormat.WEBP, 88, output))
+        }
+        if (!temporaryFile.renameTo(file)) {
+            temporaryFile.copyTo(file, overwrite = true)
+            temporaryFile.delete()
+        }
+        true
+    }.getOrElse {
+        android.util.Log.w("ScanRecordsManager", "保存封面失败: ${it.message}")
+        false
+    }
+
+    private fun artworkSizeBucket(maxPx: Int): Int {
+        val requested = maxPx.coerceAtLeast(1)
+        return artworkSizeBuckets.firstOrNull { it >= requested } ?: requested
+    }
+
+    private fun artworkCacheKey(uri: Uri, size: Int): String = "${uri}#$size"
+
+    private fun artworkCacheSizeKb(): Int {
+        val runtimeLimitKb = Runtime.getRuntime().maxMemory() / 1024L / 8L
+        return runtimeLimitKb.coerceIn(8L * 1024L, 64L * 1024L).toInt()
     }
 
     // 清理：删除所有已保存的扫描记录和封面文件
@@ -295,6 +399,9 @@ object ScanRecordsManager {
         try {
             File(context.filesDir, FILE_NAME).delete()
             File(context.filesDir, ARTWORK_DIR).deleteRecursively()
+            memoryCache.evictAll()
+            missingArtwork.clear()
+            inFlightLoads.clear()
         } catch (_: Exception) {}
     }
 }
@@ -461,46 +568,14 @@ object DataManager {
     }
 }
 
-object SmoothAnimationFrameRate {
-    @Volatile
-    var enabled: Boolean = false
-
-    val frameDelayMillis: Long
-        get() = if (enabled) 8L else 16L
-}
-
-/** 开启时优先 120Hz，关闭时锁定 60Hz。 */
-private fun applySmoothAnimationMode(activity: android.app.Activity, enabled: Boolean) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-    SmoothAnimationFrameRate.enabled = enabled
-    val display = activity.windowManager.defaultDisplay
-    val currentMode = display.mode
-    val sameResolutionModes = display.supportedModes.filter {
-        it.physicalWidth == currentMode.physicalWidth &&
-            it.physicalHeight == currentMode.physicalHeight
-    }
-    val targetMode = if (enabled) {
-        sameResolutionModes
-            .filter { kotlin.math.abs(it.refreshRate - 120f) < 1f }
-            .maxByOrNull { it.refreshRate }
-            ?: sameResolutionModes.maxByOrNull { it.refreshRate }
-    } else {
-        sameResolutionModes
-            .filter { kotlin.math.abs(it.refreshRate - 60f) < 1f }
-            .maxByOrNull { it.refreshRate }
-            ?: sameResolutionModes.minByOrNull { kotlin.math.abs(it.refreshRate - 60f) }
-    }
-
-    activity.window.attributes = activity.window.attributes.apply {
-        preferredDisplayModeId = targetMode?.modeId ?: currentMode.modeId
-        preferredRefreshRate = targetMode?.refreshRate ?: 60f
-    }
-}
-
 class MainActivity : ComponentActivity() {
     private var player: Player? by mutableStateOf(null)
     private var initError: String? by mutableStateOf(null)
     private val prefs by lazy { getSharedPreferences("music_prefs", MODE_PRIVATE) }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguageSettings.wrapContext(newBase))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -530,12 +605,11 @@ class MainActivity : ComponentActivity() {
         val savedAmoledMode = prefs.getBoolean("is_amoled_mode", false)
         val savedDjMode = prefs.getBoolean("is_dj_mode", false)
         val savedPlayerLandscape = prefs.getBoolean("player_landscape", false)
-        val savedSmoothAnimationMode = prefs.getBoolean("smooth_animation_mode", false)
+        AppAnimationSettings.enabled = prefs.getBoolean("app_animations_enabled", true)
         val lastUri = LastPlaybackManager.loadUri(this)
         val lastPosition = LastPlaybackManager.loadPosition(this)
         val lastDuration = LastPlaybackManager.loadDuration(this)
 
-        applySmoothAnimationMode(this, savedSmoothAnimationMode)
         enableEdgeToEdge()
         setContent {
             var dockPosition by remember { mutableStateOf(prefs.getString("dock_position", "bottom") ?: "bottom") }
@@ -581,14 +655,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        applySmoothAnimationMode(
-            this,
-            prefs.getBoolean("smooth_animation_mode", false)
-        )
     }
 
     override fun onDestroy() {
@@ -655,30 +721,21 @@ fun MusicApp(
 ) {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
-    val appPreferences = remember {
-        context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
-    }
-    val initialFullscreenPlayerMode = remember(initialLastUri, initialSongs) {
-        appPreferences.getBoolean("fullscreen_player_mode", false) &&
-            initialSongs.any { it.uri == initialLastUri }
-    }
-    LaunchedEffect(initialFullscreenPlayerMode) {
-        if (!initialFullscreenPlayerMode &&
-            appPreferences.getBoolean("fullscreen_player_mode", false)
-        ) {
-            appPreferences.edit { putBoolean("fullscreen_player_mode", false) }
-        }
-    }
     // 重启 Activity：用于清除全部数据 / 导入配置后重新加载所有状态
     val restartActivity: () -> Unit = { activity?.recreate() }
     val scope = rememberCoroutineScope()
-    var fullscreenPlayerMode by remember { mutableStateOf(initialFullscreenPlayerMode) }
-    var currentScreen by remember {
-        mutableStateOf<Screen>(
-            if (initialFullscreenPlayerMode) Screen.PlayerView else Screen.LocalMusic
-        )
+    var scanRecordsSaveJob by remember { mutableStateOf<Job?>(null) }
+    val scheduleScanRecordsSave: (List<Song>) -> Unit = { value ->
+        val snapshot = value.toList()
+        scanRecordsSaveJob?.cancel()
+        scanRecordsSaveJob = scope.launch {
+            delay(250L)
+            withContext(Dispatchers.IO) {
+                ScanRecordsManager.save(context, snapshot)
+            }
+        }
     }
-    var previousScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
     LaunchedEffect(currentScreen, playerLandscape) {
         activity?.requestedOrientation = when {
             currentScreen != Screen.PlayerView -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -687,28 +744,11 @@ fun MusicApp(
         }
         activity?.window?.let { window ->
             window.attributes = window.attributes.apply {
-                layoutInDisplayCutoutMode = if (currentScreen == Screen.PlayerView) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                    } else {
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                    }
-                } else {
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
-                }
-            }
-            WindowCompat.getInsetsController(window, window.decorView).apply {
-                if (currentScreen == Screen.PlayerView) {
-                    systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    hide(WindowInsetsCompat.Type.statusBars())
-                } else {
-                    show(WindowInsetsCompat.Type.systemBars())
-                }
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
             }
         }
     }
     val openPlayer = {
-        previousScreen = currentScreen
         currentScreen = Screen.PlayerView
     }
     val musicDirectories = remember { mutableStateListOf<Uri>().apply { addAll(initialDirs) } }
@@ -776,8 +816,10 @@ fun MusicApp(
                                         val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE) ?: file.name ?: "Unknown"
                                         val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: "本地音频"
                                         val artBytes = retriever.embeddedPicture
-                                        val bitmap = if (artBytes != null) BitmapFactory.decodeByteArray(artBytes, 0, artBytes.size) else null
-                                        foundSongs.add(Song(title, artist, formatFileSize(file.length()), file.uri, bitmap))
+                                        if (artBytes != null) {
+                                            ScanRecordsManager.cacheEmbeddedArtwork(context, file.uri, artBytes)
+                                        }
+                                        foundSongs.add(Song(title, artist, formatFileSize(file.length()), file.uri))
                                     } catch (_: Exception) {
                                         foundSongs.add(Song(file.name ?: "Unknown", "本地音频", formatFileSize(file.length()), file.uri))
                                     }
@@ -794,7 +836,9 @@ fun MusicApp(
                     scanResult.map { buildMediaItem(it) }
                 }
                 // 扫描完成后立即保存到磁盘，下次启动直接加载
-                ScanRecordsManager.save(context, scanResult)
+                withContext(Dispatchers.IO) {
+                    ScanRecordsManager.save(context, scanResult)
+                }
                 isScanning = false
             }
         }
@@ -935,34 +979,13 @@ fun MusicApp(
     // 不再自动扫描，用户在音乐库设置中点"立即扫描"按钮后才扫描
     LaunchedEffect(Unit) { /* 故意留空：禁用启动时及目录变化时的自动扫描 */ }
 
-    val setFullscreenPlayerMode: (Boolean) -> Unit = { enabled ->
-        if (!enabled || currentSong != null) {
-            fullscreenPlayerMode = enabled
-            appPreferences.edit { putBoolean("fullscreen_player_mode", enabled) }
-            previousScreen = Screen.LocalMusic
-            currentScreen = if (enabled) Screen.PlayerView else Screen.LocalMusic
-        }
-    }
-
     // 提取统一的返回逻辑
     val handleBack: () -> Unit = {
-        if (fullscreenPlayerMode && currentScreen == Screen.PlayerView) {
-            activity?.moveTaskToBack(true)
-        } else {
-            currentScreen = when (currentScreen) {
-                Screen.Library, Screen.Data, Screen.Playback, Screen.AudioCodecs,
-                Screen.AboutSupport -> Screen.Settings
-                Screen.Equalizer -> Screen.LocalMusic
-                Screen.WebDav -> Screen.Settings
-                Screen.LocalMusic -> Screen.LocalMusic
-                Screen.PlayerView -> previousScreen
-                else -> Screen.LocalMusic
-            }
-        }
+        currentScreen.backDestination()?.let { currentScreen = it }
         Unit
     }
 
-    val playSongFromQuickList: (Song) -> Unit = { selectedSong ->
+    val startSongPlayback: (Song) -> Unit = { selectedSong ->
         currentSong = selectedSong
         try {
             val index = songs.indexOf(selectedSong)
@@ -1005,6 +1028,15 @@ fun MusicApp(
             predictiveBackDirection = 1f
         }
     }
+    val floatingDockArtwork = currentSong?.let { rememberArtwork(it) }
+    var floatingDockDragProgress by remember { mutableFloatStateOf(0f) }
+    var floatingDockDragging by remember { mutableStateOf(false) }
+    LaunchedEffect(dockPosition) {
+        if (!dockPosition.equals("float", ignoreCase = true)) {
+            floatingDockDragProgress = 0f
+            floatingDockDragging = false
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -1017,15 +1049,13 @@ fun MusicApp(
                 alpha = 1f - progress * 0.12f
             }
     ) {
-        val dockScreens = setOf(Screen.LocalMusic, Screen.Equalizer, Screen.Settings)
-        val showDock = !fullscreenPlayerMode && currentScreen in dockScreens
         val isFloatDock = dockPosition.equals("float", ignoreCase = true)
-        // 悬浮层仅用于音乐列表，避免遮挡设置/均衡器等其它页面
-        val floatOverlayActive = isFloatDock && currentScreen == Screen.LocalMusic
-        val showFixedBottomBar = showDock && (
-            dockPosition == "bottom" ||
-                (isFloatDock && currentScreen != Screen.LocalMusic)
-        )
+        val dockScreens = setOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
+        val showDock = currentScreen in dockScreens || isFloatDock
+        val floatOverlayActive = isFloatDock
+        val floatDockHasMiniPlayer = currentSong != null && currentScreen != Screen.PlayerView
+        val floatingDockSpace = if (floatDockHasMiniPlayer) 160.dp else 92.dp
+        val showFixedBottomBar = showDock && dockPosition == "bottom"
         Scaffold(
             containerColor = if (currentScreen == Screen.PlayerView) Color.Transparent
                 else MaterialTheme.colorScheme.background,
@@ -1033,7 +1063,7 @@ fun MusicApp(
                 if (showDock && dockPosition == "top") {
                     Column(Modifier.padding(top = 8.dp)) {
                         MusicDock(currentScreen = currentScreen, onNavigate = { currentScreen = it })
-                        if (currentSong != null) MD3MiniPlayer(
+                        if (currentSong != null && currentScreen != Screen.PlayerView) MD3MiniPlayer(
                             song = currentSong!!,
                             isPlaying = isPlaying,
                             progress = if (totalDuration > 0) currentPosition.toFloat() / totalDuration else 0f,
@@ -1047,10 +1077,10 @@ fun MusicApp(
                 }
             },
             bottomBar = {
-                // 底部固定栏；悬浮偏好下除音乐列表外也走固定栏，避免干扰其它页面
+                // 仅固定底部模式使用 Scaffold 底栏；悬浮模式始终作为透明覆盖层绘制。
                 if (showFixedBottomBar) {
                     Column {
-                        if (currentSong != null) {
+                        if (currentSong != null && currentScreen != Screen.PlayerView) {
                         MD3MiniPlayer(
                             song = currentSong!!,
                             isPlaying = isPlaying,
@@ -1071,20 +1101,13 @@ fun MusicApp(
             }
         ) { innerPadding ->
             Box(
-                modifier = Modifier.padding(
-                    // 仅音乐列表悬浮层时内容铺满；其它页面使用 Scaffold 正常 padding
-                    if (floatOverlayActive) PaddingValues(0.dp) else innerPadding
-                )
+                modifier = Modifier.padding(innerPadding)
             ) {
                 AnimatedContent(
                     targetState = currentScreen,
                     transitionSpec = {
-                        if (targetState == Screen.PlayerView) {
-                            (slideInVertically { it } + fadeIn()) togetherWith
-                                (slideOutVertically { -it } + fadeOut())
-                        } else if (initialState == Screen.PlayerView) {
-                            (slideInVertically { -it } + fadeIn()) togetherWith
-                                (slideOutVertically { it } + fadeOut())
+                        if (!AppAnimationSettings.enabled) {
+                            EnterTransition.None togetherWith ExitTransition.None
                         } else {
                             fadeIn() togetherWith fadeOut()
                         }
@@ -1093,7 +1116,8 @@ fun MusicApp(
                 ) { screen ->
                     when (screen) {
                         Screen.PlayerView -> {
-                            currentSong?.let { song ->
+                            val song = currentSong
+                            if (song != null) {
                                 FullPlayerScreen(
                                     song = song,
                                     lyrics = currentSongLyrics,
@@ -1126,13 +1150,10 @@ fun MusicApp(
                                     },
                                     onNext = { player.seekToNext() },
                                     onPrevious = { player.seekToPrevious() },
-                                    onBack = handleBack,
-                                    onExitFullscreenMode = { setFullscreenPlayerMode(false) },
-                                    fullscreenPlayerMode = fullscreenPlayerMode,
                                     context = context,
                                     musicDirectories = musicDirectories.toList(),
                                     songs = songs,
-                                    onSelectSong = playSongFromQuickList,
+                                    onSelectSong = startSongPlayback,
                                     repeatMode = repeatMode,
                                     onRepeatModeChange = {
                                         repeatMode = when (repeatMode) {
@@ -1143,42 +1164,41 @@ fun MusicApp(
                                     },
                                     shuffleMode = shuffleMode,
                                     onShuffleModeChange = { shuffleMode = !shuffleMode },
-                                    isLandscape = playerLandscape
+                                    isLandscape = playerLandscape,
+                                    floatingDockVisible = floatOverlayActive
                                 )
+                            } else {
+                                Box(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(
+                                            Icons.Default.MusicOff,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(64.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Spacer(Modifier.height(12.dp))
+                                        Text(
+                                            appText("暂无正在播放的歌曲", "Nothing is playing"),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
                             }
                         }
                         Screen.LocalMusic -> LocalMusicScreen(
                             songs = songs,
                             isScanning = isScanning,
-                            bottomContentPadding = if (floatOverlayActive) {
-                                // 仅音乐列表悬浮层预留底部，避免最后几首被挡住
-                                if (currentSong != null) 156.dp else 90.dp
-                            } else {
-                                0.dp
-                            },
+                            backgroundArtwork = floatingDockArtwork,
+                            bottomContentPadding = if (floatOverlayActive) floatingDockSpace else 0.dp,
                             onSongClick = { song ->
-                                currentSong = song
-                                try {
-                                    val index = songs.indexOf(song)
-                                    // 如果 mediaItemsList 还没构建好，先同步构建
-                                    if (!mediaItemsReady || mediaItemsList.size != songs.size) {
-                                        mediaItemsList = songs.map { buildMediaItem(it) }
-                                        mediaItemsReady = true
-                                    }
-                                    if (index >= 0 && mediaItemsList.size == songs.size) {
-                                        player.setMediaItems(mediaItemsList, index, 0L)
-                                    } else {
-                                        player.setMediaItem(MediaItem.fromUri(song.uri))
-                                    }
-                                    player.prepare()
-                                    player.play()
-                                } catch (e: Throwable) {
-                                    android.util.Log.e("MusicApp", "播放启动失败", e)
-                                }
+                                startSongPlayback(song)
                                 val openOnClick = context
                                     .getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
                                     .getBoolean("open_player_on_song_click", false)
-                                if (fullscreenPlayerMode || openOnClick) openPlayer()
+                                if (openOnClick) openPlayer()
                             },
                             onReorder = { from, to ->
                                 val newList = songs.toMutableList()
@@ -1192,7 +1212,7 @@ fun MusicApp(
                                     } catch (_: Exception) {}
                                 }
                                 // 重新保存扫描记录以持久化顺序
-                                ScanRecordsManager.save(context, newList)
+                                scheduleScanRecordsSave(newList)
                             }
                         )
                         Screen.Settings -> SettingsMenu(
@@ -1208,61 +1228,59 @@ fun MusicApp(
                             directories = musicDirectories,
                             isScanning = isScanning,
                             onScanNow = { triggerScan() }
-                        ) { currentScreen = Screen.Settings }
+                        ) { handleBack() }
                         Screen.WebDav -> WebDavSettingsScreen(
-                            onBack = { currentScreen = Screen.Settings },
+                            onBack = handleBack,
                             onSongsLoaded = { remoteSongs ->
                                 songs = (songs.filterNot { it.artist == "WebDAV" } + remoteSongs)
                                 mediaItemsList = songs.map { buildMediaItem(it) }
                                 mediaItemsReady = true
-                                ScanRecordsManager.save(context, songs)
+                                scheduleScanRecordsSave(songs)
                             }
                         )
                         Screen.Data -> DataSettingsScreen(
-                            onBack = { currentScreen = Screen.Settings },
+                            onBack = handleBack,
                             onRestart = restartActivity
                         )
                         Screen.Playback -> PlaybackSettingsScreen(
                             isDjMode = isDjMode,
                             onDjModeChange = onDjModeChange,
-                            fullscreenPlayerMode = fullscreenPlayerMode,
-                            hasCurrentSong = currentSong != null,
-                            onFullscreenPlayerModeChange = setFullscreenPlayerMode,
-                            onBack = { currentScreen = Screen.Settings }
+                            onBack = handleBack
+                        )
+                        Screen.AudioOutput -> AudioOutputSettingsScreen(
+                            onBack = handleBack
+                        )
+                        Screen.LyricsAndDevices -> LyricsAndDevicesSettingsScreen(
+                            onBack = handleBack
                         )
                         Screen.AudioCodecs -> AudioCodecSupportScreen(
-                            onBack = { currentScreen = Screen.Settings }
+                            onBack = handleBack
                         )
                         Screen.AboutSupport -> AboutSupportScreen(
-                            onBack = { currentScreen = Screen.Settings }
+                            onBack = handleBack
                         )
                         Screen.Equalizer -> EqualizerSettingsScreen(
-                            onBack = { currentScreen = Screen.LocalMusic }
+                            onBack = handleBack
                         )
                     }
                 }
             }
         }
 
-        // 悬浮底部 Dock：真正浮在内容之上（圆角卡片 + 边距 + 半透明）
+        // 悬浮 Dock 在所有页面保持可见，页面继续绘制到窗口后方。
         if (floatOverlayActive) {
-            Column(
+            FloatingDockWindow(
+                artwork = floatingDockArtwork,
+                dragProgress = floatingDockDragProgress,
+                isDragging = floatingDockDragging,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
                     .zIndex(10f)
                     .navigationBarsPadding()
                     .padding(start = 12.dp, end = 12.dp, bottom = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (currentSong != null) {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(20.dp),
-                        tonalElevation = 4.dp,
-                        shadowElevation = 10.dp,
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f)
-                    ) {
+                miniPlayer = if (floatDockHasMiniPlayer) {
+                    {
                         MD3MiniPlayer(
                             song = currentSong!!,
                             isPlaying = isPlaying,
@@ -1274,20 +1292,19 @@ fun MusicApp(
                             onSeek = { player.seekTo((it * totalDuration).toLong()) }
                         )
                     }
+                } else {
+                    null
                 }
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(28.dp),
-                    tonalElevation = 6.dp,
-                    shadowElevation = 14.dp,
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.94f)
-                ) {
-                    MusicDock(
-                        currentScreen = currentScreen,
-                        onNavigate = { currentScreen = it },
-                        floating = true
-                    )
-                }
+            ) {
+                MusicDock(
+                    currentScreen = currentScreen,
+                    onNavigate = { currentScreen = it },
+                    floating = true,
+                    onLiquidDragChange = { progress, dragging ->
+                        floatingDockDragProgress = progress
+                        floatingDockDragging = dragging
+                    }
+                )
             }
         }
     }
@@ -1307,6 +1324,7 @@ fun MusicApp(
 fun LocalMusicScreen(
     songs: List<Song>,
     isScanning: Boolean,
+    backgroundArtwork: Bitmap?,
     onSongClick: (Song) -> Unit,
     onReorder: (Int, Int) -> Unit,
     bottomContentPadding: androidx.compose.ui.unit.Dp = 0.dp
@@ -1344,11 +1362,36 @@ fun LocalMusicScreen(
         }
     }
 
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        modifier = Modifier.statusBarsPadding()
-    ) { padding ->
-        Box(Modifier.padding(padding)) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        if (backgroundArtwork != null) {
+            androidx.compose.foundation.Image(
+                bitmap = backgroundArtwork.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = 1.16f
+                        scaleY = 1.16f
+                        alpha = 0.42f
+                    }
+                    .blur(52.dp)
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.62f))
+            )
+        }
+        Scaffold(
+            containerColor = Color.Transparent,
+            modifier = Modifier.statusBarsPadding()
+        ) { padding ->
+            Box(Modifier.padding(padding)) {
             if (isScanning) {
                 Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
             } else if (songs.isEmpty()) {
@@ -1356,7 +1399,7 @@ fun LocalMusicScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.MusicOff, null, Modifier.size(64.dp), MaterialTheme.colorScheme.onSurfaceVariant)
                         Spacer(Modifier.height(8.dp))
-                        Text("暂无本地音乐", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(appText("暂无本地音乐", "No local music"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             } else {
@@ -1366,7 +1409,7 @@ fun LocalMusicScreen(
                     contentPadding = PaddingValues(bottom = bottomContentPadding)
                 ) {
                     itemsIndexed(songs, key = { _, song -> song.uri.toString() }) { index, song ->
-                        val artwork = rememberArtwork(song)
+                        val artwork = rememberArtwork(song, maxPx = 96)
                         val isDragging = index == draggingItemIndex
                         
                         ListItem(
@@ -1398,7 +1441,7 @@ fun LocalMusicScreen(
                             trailingContent = {
                                 Icon(
                                     Icons.Default.DragHandle,
-                                    contentDescription = "拖动排序",
+                                    contentDescription = appText("拖动排序", "Drag to reorder"),
                                     modifier = Modifier
                                         .size(32.dp)
                                         .padding(4.dp)
@@ -1436,12 +1479,17 @@ fun LocalMusicScreen(
                                         },
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                                 )
-                            }
+                            },
+                            colors = ListItemDefaults.colors(
+                                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)
+                            )
                         )
                     }
                 }
             }
         }
+    }
+
     }
 
     detailSong?.let { selectedSong ->
@@ -1470,27 +1518,59 @@ fun SettingsMenu(
     val preferences = remember {
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
     }
-    var smoothAnimationMode by remember {
-        mutableStateOf(preferences.getBoolean("smooth_animation_mode", false))
+    var animationEffectsEnabled by remember {
+        mutableStateOf(preferences.getBoolean("app_animations_enabled", true))
     }
-    fun setSmoothAnimationMode(enabled: Boolean) {
-        smoothAnimationMode = enabled
-        preferences.edit { putBoolean("smooth_animation_mode", enabled) }
-        (context as? android.app.Activity)?.let { activity ->
-            applySmoothAnimationMode(activity, enabled)
-        }
+    var appLanguage by remember { mutableStateOf(AppLanguageSettings.load(context)) }
+    fun setAnimationEffectsEnabled(enabled: Boolean) {
+        animationEffectsEnabled = enabled
+        AppAnimationSettings.enabled = enabled
+        preferences.edit { putBoolean("app_animations_enabled", enabled) }
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("设置") }) }) { padding ->
+    Scaffold(topBar = { TopAppBar(title = { Text(appText("设置", "Settings")) }) }) { padding ->
         Column(Modifier.padding(padding).verticalScroll(rememberScrollState())) {
+            SettingsSectionHeader(appText("界面", "Appearance"))
             ListItem(
-                headlineContent = { Text("Dock 位置") },
+                headlineContent = { Text(appText("语言", "Language")) },
+                supportingContent = { Text(appText("切换后自动重新载入界面", "The interface reloads after changing language")) },
+                leadingContent = { Icon(Icons.Default.Language, null) }
+            )
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                AppLanguage.entries.forEachIndexed { index, language ->
+                    SegmentedButton(
+                        selected = appLanguage == language,
+                        onClick = {
+                            if (appLanguage != language) {
+                                appLanguage = language
+                                AppLanguageSettings.save(context, language)
+                                (context as? android.app.Activity)?.recreate()
+                            }
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index, AppLanguage.entries.size)
+                    ) {
+                        Text(
+                            when (language) {
+                                AppLanguage.SYSTEM -> appText("系统", "System")
+                                AppLanguage.SIMPLIFIED_CHINESE -> "简体中文"
+                                AppLanguage.ENGLISH -> "English"
+                            }
+                        )
+                    }
+                }
+            }
+            ListItem(
+                headlineContent = { Text(appText("Dock 位置", "Dock position")) },
                 supportingContent = {
                     Text(
                         when (dockPosition) {
-                            "top" -> "顶部 Dock"
-                            "float" -> "仅音乐列表悬浮；设置/均衡器等页面仍用固定底栏，不遮挡内容"
-                            else -> "底部 Dock"
+                            "top" -> appText("顶部 Dock", "Top dock")
+                            "float" -> appText("所有页面悬浮显示，底部内容透过毛玻璃可见", "Floats on every screen with page content visible through the glass")
+                            else -> appText("底部 Dock", "Bottom dock")
                         }
                     )
                 },
@@ -1505,22 +1585,22 @@ fun SettingsMenu(
                     selected = dockPosition == "top",
                     onClick = { onDockPositionChange("top") },
                     shape = SegmentedButtonDefaults.itemShape(0, 3)
-                ) { Text("顶部") }
+                ) { Text(appText("顶部", "Top")) }
                 SegmentedButton(
                     selected = dockPosition == "bottom",
                     onClick = { onDockPositionChange("bottom") },
                     shape = SegmentedButtonDefaults.itemShape(1, 3)
-                ) { Text("底部") }
+                ) { Text(appText("底部", "Bottom")) }
                 SegmentedButton(
                     selected = dockPosition == "float",
                     onClick = { onDockPositionChange("float") },
                     shape = SegmentedButtonDefaults.itemShape(2, 3)
-                ) { Text("悬浮") }
+                ) { Text(appText("悬浮", "Floating")) }
             }
             HorizontalDivider()
             ListItem(
-                headlineContent = { Text("播放页方向") },
-                supportingContent = { Text(if (playerLandscape) "固定横屏" else "固定竖屏") },
+                headlineContent = { Text(appText("播放页方向", "Player orientation")) },
+                supportingContent = { Text(if (playerLandscape) appText("固定横屏", "Landscape") else appText("固定竖屏", "Portrait")) },
                 leadingContent = { Icon(Icons.Default.ScreenRotation, null) },
                 trailingContent = {
                     SingleChoiceSegmentedButtonRow {
@@ -1528,72 +1608,62 @@ fun SettingsMenu(
                             selected = !playerLandscape,
                             onClick = { onPlayerLandscapeChange(false) },
                             shape = SegmentedButtonDefaults.itemShape(0, 2)
-                        ) { Text("竖屏") }
+                        ) { Text(appText("竖屏", "Portrait")) }
                         SegmentedButton(
                             selected = playerLandscape,
                             onClick = { onPlayerLandscapeChange(true) },
                             shape = SegmentedButtonDefaults.itemShape(1, 2)
-                        ) { Text("横屏") }
+                        ) { Text(appText("横屏", "Landscape")) }
                     }
                 }
             )
             ListItem(
-                headlineContent = { Text("AMOLED 模式") },
-                supportingContent = { Text("深色模式下使用纯黑背景") },
+                headlineContent = { Text("AMOLED") },
+                supportingContent = { Text(appText("深色模式下使用纯黑背景", "Use a pure black background in dark mode")) },
                 leadingContent = { Icon(Icons.Default.Brightness2, null) },
                 trailingContent = { Switch(isAmoledMode, onAmoledModeChange) },
                 modifier = Modifier.clickable { onAmoledModeChange(!isAmoledMode) }
             )
             ListItem(
-                headlineContent = { Text("流畅动画模式") },
+                headlineContent = { Text(appText("动画效果", "Animations")) },
                 supportingContent = {
                     Text(
-                        if (smoothAnimationMode) {
-                            "整个应用优先使用 120 FPS；不支持时自动使用设备最高刷新率"
+                        if (animationEffectsEnabled) {
+                            appText("启用页面切换、专辑封面和频谱动画", "Enable screen, artwork, and spectrum animations")
                         } else {
-                            "当前固定 60 FPS；开启后让全部页面和动画使用高刷新率"
+                            appText("减少动态效果，页面内容立即切换", "Reduce motion and switch content immediately")
                         }
                     )
                 },
                 leadingContent = { Icon(Icons.Default.Speed, null) },
                 trailingContent = {
                     Switch(
-                        checked = smoothAnimationMode,
-                        onCheckedChange = { setSmoothAnimationMode(it) }
+                        checked = animationEffectsEnabled,
+                        onCheckedChange = { setAnimationEffectsEnabled(it) }
                     )
                 },
                 modifier = Modifier.clickable {
-                    setSmoothAnimationMode(!smoothAnimationMode)
+                    setAnimationEffectsEnabled(!animationEffectsEnabled)
                 }
             )
-            HorizontalDivider()
-            SettingsSectionHeader("界面与播放")
-            SettingsItem("播放设置", Icons.Default.GraphicEq) { onNavigate(Screen.Playback) }
-            SettingsItem("音频解码支持", Icons.Default.AudioFile) { onNavigate(Screen.AudioCodecs) }
-            SettingsSectionHeader("音乐来源")
-            SettingsItem("音乐库", Icons.Default.LibraryMusic) { onNavigate(Screen.Library) }
-            SettingsItem("WebDAV 音乐源", Icons.Default.CloudQueue) { onNavigate(Screen.WebDav) }
-            SettingsSectionHeader("数据管理")
-            SettingsItem("数据", Icons.Default.Storage) { onNavigate(Screen.Data) }
-            SettingsSectionHeader("关于")
-            SettingsItem("关于与支持", Icons.Default.Info) { onNavigate(Screen.AboutSupport) }
+            SettingsSectionHeader(appText("播放与声音", "Playback and audio"))
+            SettingsItem(appText("播放设置", "Playback settings"), Icons.Default.GraphicEq) { onNavigate(Screen.Playback) }
+            SettingsItem(appText("音频输出与增益", "Audio output and gain"), Icons.Default.Speaker) {
+                onNavigate(Screen.AudioOutput)
+            }
+            SettingsItem(appText("音频解码支持", "Audio codec support"), Icons.Default.AudioFile) { onNavigate(Screen.AudioCodecs) }
+            SettingsSectionHeader(appText("歌词与连接", "Lyrics and connections"))
+            SettingsItem(appText("歌词与外部设备", "Lyrics and devices"), Icons.Default.Subtitles) {
+                onNavigate(Screen.LyricsAndDevices)
+            }
+            SettingsSectionHeader(appText("音乐来源", "Music sources"))
+            SettingsItem(appText("音乐库", "Music library"), Icons.Default.LibraryMusic) { onNavigate(Screen.Library) }
+            SettingsItem(appText("WebDAV 音乐源", "WebDAV source"), Icons.Default.CloudQueue) { onNavigate(Screen.WebDav) }
+            SettingsSectionHeader(appText("数据与支持", "Data and support"))
+            SettingsItem(appText("数据", "Data"), Icons.Default.Storage) { onNavigate(Screen.Data) }
+            SettingsItem(appText("关于与支持", "About and support"), Icons.Default.Info) { onNavigate(Screen.AboutSupport) }
         }
     }
-}
-
-@Composable
-fun SettingsItem(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
-    ListItem(headlineContent = { Text(label) }, leadingContent = { Icon(icon, null) }, trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) }, modifier = Modifier.clickable { onClick() } )
-}
-
-@Composable
-private fun SettingsSectionHeader(label: String) {
-    Text(
-        text = label,
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(start = 16.dp, top = 18.dp, end = 16.dp, bottom = 6.dp)
-    )
 }
 
 private data class AudioDecoderInfo(
@@ -1768,25 +1838,160 @@ private fun SongDetailRow(label: String, value: String) {
 }
 
 @Composable
+private fun FloatingDockWindow(
+    artwork: Bitmap?,
+    dragProgress: Float,
+    isDragging: Boolean,
+    modifier: Modifier = Modifier,
+    miniPlayer: (@Composable () -> Unit)? = null,
+    dock: @Composable () -> Unit
+) {
+    val animationsEnabled = AppAnimationSettings.enabled
+    val liquidProgress by animateFloatAsState(
+        targetValue = dragProgress.coerceIn(-1f, 1f),
+        animationSpec = if (isDragging || !animationsEnabled) {
+            snap()
+        } else {
+            spring(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMediumLow
+            )
+        },
+        label = "FloatingDockLiquidDrag"
+    )
+    val dragEnergy = kotlin.math.abs(liquidProgress)
+    val shape = RoundedCornerShape((24f + dragEnergy * 6f).dp)
+    val blurTransition = rememberInfiniteTransition(label = "FloatingDockBlur")
+    val animatedBlurRadius by blurTransition.animateFloat(
+        initialValue = 28f,
+        targetValue = 38f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2_800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "FloatingDockBlurRadius"
+    )
+    val blurRadius = (if (animationsEnabled) animatedBlurRadius else 33f) + dragEnergy * 10f
+    Surface(
+        modifier = modifier.graphicsLayer {
+            val directionAnchor = if (liquidProgress >= 0f) 0f else 1f
+            transformOrigin = TransformOrigin(directionAnchor, 0.5f)
+            translationX = liquidProgress * size.width * 0.025f
+            scaleX = 1f + dragEnergy * 0.055f
+            scaleY = 1f - dragEnergy * 0.025f
+            rotationZ = liquidProgress * 0.8f
+        },
+        shape = shape,
+        color = Color.Transparent,
+        tonalElevation = 0.dp,
+        shadowElevation = 16.dp,
+        border = BorderStroke(
+            1.dp,
+            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+        )
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(shape)
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.16f))
+        ) {
+            AnimatedContent(
+                targetState = artwork,
+                modifier = Modifier.matchParentSize(),
+                transitionSpec = {
+                    if (AppAnimationSettings.enabled) {
+                        fadeIn(tween(450)) togetherWith fadeOut(tween(450))
+                    } else {
+                        EnterTransition.None togetherWith ExitTransition.None
+                    }
+                },
+                label = "FloatingDockArtworkBlur"
+            ) { targetArtwork ->
+                if (targetArtwork != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = targetArtwork.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .matchParentSize()
+                            .graphicsLayer {
+                                scaleX = 1.24f
+                                scaleY = 1.24f
+                                alpha = 0.42f
+                            }
+                            .blur(blurRadius.dp)
+                    )
+                }
+            }
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.32f))
+            )
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .graphicsLayer {
+                        translationX = liquidProgress * size.width * 0.16f
+                        alpha = 0.22f + dragEnergy * 0.28f
+                    }
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(
+                                Color.Transparent,
+                                Color.White.copy(alpha = 0.38f),
+                                Color.Transparent
+                            )
+                        )
+                    )
+            )
+            Column {
+                miniPlayer?.invoke()
+                if (miniPlayer != null) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                }
+                dock()
+            }
+        }
+    }
+}
+
+private fun dockRootScreen(screen: Screen): Screen = when (screen) {
+    Screen.LocalMusic -> Screen.LocalMusic
+    Screen.PlayerView -> Screen.PlayerView
+    Screen.Equalizer -> Screen.Equalizer
+    else -> Screen.Settings
+}
+
+@Composable
 private fun MusicDock(
     currentScreen: Screen,
     onNavigate: (Screen) -> Unit,
-    floating: Boolean = false
+    floating: Boolean = false,
+    onLiquidDragChange: (Float, Boolean) -> Unit = { _, _ -> }
 ) {
     val dockScreens = remember {
-        listOf(Screen.LocalMusic, Screen.Equalizer, Screen.Settings)
+        listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
     }
+    val selectedScreen = dockRootScreen(currentScreen)
     val dragThreshold = with(LocalDensity.current) { 48.dp.toPx() }
     var dragOffset by remember { mutableFloatStateOf(0f) }
     val dockModifier = (if (floating) Modifier.height(68.dp) else Modifier)
         .graphicsLayer {
-            translationX = dragOffset * 0.16f
+            translationX = if (floating) 0f else dragOffset * 0.16f
         }
         .pointerInput(currentScreen, dragThreshold) {
             detectHorizontalDragGestures(
-                onDragCancel = { dragOffset = 0f },
+                onDragStart = {
+                    if (floating) onLiquidDragChange(0f, true)
+                },
+                onDragCancel = {
+                    dragOffset = 0f
+                    if (floating) onLiquidDragChange(0f, false)
+                },
                 onDragEnd = {
-                    val currentIndex = dockScreens.indexOf(currentScreen)
+                    val currentIndex = dockScreens.indexOf(selectedScreen)
                     if (currentIndex >= 0 && kotlin.math.abs(dragOffset) >= dragThreshold) {
                         val targetIndex = if (dragOffset < 0f) {
                             (currentIndex + 1).coerceAtMost(dockScreens.lastIndex)
@@ -1798,11 +2003,19 @@ private fun MusicDock(
                         }
                     }
                     dragOffset = 0f
+                    if (floating) onLiquidDragChange(0f, false)
                 }
             ) { change, dragAmount ->
                 change.consume()
-                dragOffset = (dragOffset + dragAmount)
+                val nextOffset = (dragOffset + dragAmount)
                     .coerceIn(-dragThreshold * 1.5f, dragThreshold * 1.5f)
+                dragOffset = nextOffset
+                if (floating) {
+                    onLiquidDragChange(
+                        (nextOffset / (dragThreshold * 1.5f)).coerceIn(-1f, 1f),
+                        true
+                    )
+                }
             }
         }
 
@@ -1813,22 +2026,28 @@ private fun MusicDock(
         windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
     ) {
         NavigationBarItem(
-            selected = currentScreen == Screen.LocalMusic,
+            selected = selectedScreen == Screen.LocalMusic,
             onClick = { onNavigate(Screen.LocalMusic) },
-            icon = { Icon(Icons.Default.LibraryMusic, "音乐") },
-            label = { Text("音乐") }
+            icon = { Icon(Icons.Default.LibraryMusic, appText("音乐", "Music")) },
+            label = { Text(appText("音乐", "Music")) }
         )
         NavigationBarItem(
-            selected = currentScreen == Screen.Equalizer,
+            selected = selectedScreen == Screen.PlayerView,
+            onClick = { onNavigate(Screen.PlayerView) },
+            icon = { Icon(Icons.Default.PlayCircle, appText("播放", "Player")) },
+            label = { Text(appText("播放", "Player")) }
+        )
+        NavigationBarItem(
+            selected = selectedScreen == Screen.Equalizer,
             onClick = { onNavigate(Screen.Equalizer) },
-            icon = { Icon(Icons.Default.Equalizer, "均衡器") },
-            label = { Text("均衡器") }
+            icon = { Icon(Icons.Default.Equalizer, appText("均衡器", "Equalizer")) },
+            label = { Text(appText("均衡器", "Equalizer")) }
         )
         NavigationBarItem(
-            selected = currentScreen == Screen.Settings,
+            selected = selectedScreen == Screen.Settings,
             onClick = { onNavigate(Screen.Settings) },
-            icon = { Icon(Icons.Default.Settings, "设置") },
-            label = { Text("设置") }
+            icon = { Icon(Icons.Default.Settings, appText("设置", "Settings")) },
+            label = { Text(appText("设置", "Settings")) }
         )
     }
 }
@@ -1838,75 +2057,26 @@ private fun MusicDock(
 fun PlaybackSettingsScreen(
     isDjMode: Boolean,
     onDjModeChange: (Boolean) -> Unit,
-    fullscreenPlayerMode: Boolean,
-    hasCurrentSong: Boolean,
-    onFullscreenPlayerModeChange: (Boolean) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
-    var overlayEnabled by remember {
-        mutableStateOf(OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning())
+    var artworkBeatEnabled by remember {
+        mutableStateOf(preferences.getBoolean("artwork_beat_enabled", true))
     }
-    var carLyricsEnabled by remember {
-        mutableStateOf(preferences.getBoolean("car_lyrics_enabled", true))
+    var spectrumProgressEnabled by remember {
+        mutableStateOf(preferences.getBoolean("spectrum_progress_enabled", true))
     }
-    var lyricsProviderEnabled by remember {
-        mutableStateOf(preferences.getBoolean("lyrics_provider_enabled", true))
-    }
-    val canDrawOverlays = remember {
-        mutableStateOf(android.provider.Settings.canDrawOverlays(context))
-    }
-    val hostActivity = context as? ComponentActivity
-    DisposableEffect(hostActivity) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                canDrawOverlays.value = android.provider.Settings.canDrawOverlays(context)
-                overlayEnabled = OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning()
-                if (OverlayLyricsService.isEnabled(context) && canDrawOverlays.value) {
-                    OverlayLyricsService.startIfEnabled(context)
-                    overlayEnabled = true
-                }
-            }
-        }
-        hostActivity?.lifecycle?.addObserver(observer)
-        onDispose { hostActivity?.lifecycle?.removeObserver(observer) }
-    }
-    fun setOverlayLyrics(enabled: Boolean) {
-        if (enabled) {
-            if (!android.provider.Settings.canDrawOverlays(context)) {
-                OverlayLyricsService.setEnabled(context, true)
-                val intent = Intent(
-                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    "package:${context.packageName}".toUri()
-                )
-                context.startActivity(intent)
-                overlayEnabled = false
-                return
-            }
-            OverlayLyricsService.setEnabled(context, true)
-            OverlayLyricsService.start(context)
-            overlayEnabled = true
-        } else {
-            OverlayLyricsService.setEnabled(context, false)
-            OverlayLyricsService.stop(context)
-            overlayEnabled = false
-        }
-    }
-    fun setLyricsProviderEnabled(enabled: Boolean) {
-        lyricsProviderEnabled = enabled
-        preferences.edit { putBoolean("lyrics_provider_enabled", enabled) }
-        if (enabled) LyricsInteropPublisher.publish(context, force = true)
-        context.contentResolver.notifyChange(LyricsProviderContract.STATE_URI, null)
-        context.contentResolver.notifyChange(LyricsProviderContract.LYRICS_URI, null)
+    var openPlayerOnSongClick by remember {
+        mutableStateOf(preferences.getBoolean("open_player_on_song_click", false))
     }
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("播放设置") },
+                title = { Text(appText("播放设置", "Playback settings")) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, appText("返回", "Back"))
                     }
                 }
             )
@@ -1915,41 +2085,13 @@ fun PlaybackSettingsScreen(
         Column(
             modifier = Modifier
                 .padding(padding)
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+                .verticalScroll(rememberScrollState())
         ) {
+            SettingsSectionHeader(appText("播放行为", "Playback behavior"))
             ListItem(
-                headlineContent = { Text("全屏播放模式") },
+                headlineContent = { Text(appText("打碟模式", "DJ mode")) },
                 supportingContent = {
-                    Text(
-                        when {
-                            !hasCurrentSong -> "请先播放一首歌曲后再开启"
-                            fullscreenPlayerMode -> "锁定播放页；左上角退出模式，下滑或系统返回直接回到桌面"
-                            else -> "隐藏音乐库与 Dock，锁定显示全屏播放页"
-                        }
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.Fullscreen, null) },
-                trailingContent = {
-                    Switch(
-                        checked = fullscreenPlayerMode,
-                        onCheckedChange = onFullscreenPlayerModeChange,
-                        enabled = hasCurrentSong
-                    )
-                },
-                modifier = if (hasCurrentSong) {
-                    Modifier.clickable {
-                        onFullscreenPlayerModeChange(!fullscreenPlayerMode)
-                    }
-                } else {
-                    Modifier
-                }
-            )
-            ListItem(
-                headlineContent = { Text("打碟模式") },
-                supportingContent = {
-                    Text("拖动播放进度时启用实时定位、动态速度与唱片转盘效果")
+                    Text(appText("拖动播放进度时启用实时定位、动态速度与唱片转盘效果", "Enable live seeking, variable speed, and turntable effects while dragging"))
                 },
                 leadingContent = { Icon(Icons.Default.Album, null) },
                 trailingContent = {
@@ -1958,118 +2100,13 @@ fun PlaybackSettingsScreen(
                 modifier = Modifier.clickable { onDjModeChange(!isDjMode) }
             )
             ListItem(
-                headlineContent = { Text("悬浮歌词") },
-                supportingContent = {
-                    Text(
-                        if (canDrawOverlays.value) {
-                            "在其它应用上方显示可拖动的当前歌词，并按单字高亮进度"
-                        } else {
-                            "需要授予「显示在其他应用上层」权限，点击开关将跳转系统设置"
-                        }
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.Subtitles, null) },
-                trailingContent = {
-                    Switch(
-                        checked = overlayEnabled,
-                        onCheckedChange = { setOverlayLyrics(it) }
-                    )
-                },
-                modifier = Modifier.clickable { setOverlayLyrics(!overlayEnabled) }
-            )
-            ListItem(
-                headlineContent = { Text("车载歌词") },
-                supportingContent = {
-                    Text("在 Android Auto、车载媒体卡片和支持媒体元数据的蓝牙车机上显示当前歌词")
-                },
-                leadingContent = { Icon(Icons.Default.DirectionsCar, null) },
-                trailingContent = {
-                    Switch(
-                        checked = carLyricsEnabled,
-                        onCheckedChange = {
-                            carLyricsEnabled = it
-                            preferences.edit { putBoolean("car_lyrics_enabled", it) }
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    carLyricsEnabled = !carLyricsEnabled
-                    preferences.edit { putBoolean("car_lyrics_enabled", carLyricsEnabled) }
-                }
-            )
-            ListItem(
-                headlineContent = { Text("通用歌词提供服务") },
-                supportingContent = {
-                    Text("向歌词软件发送歌曲、播放位置、逐字进度，并提供完整歌词查询接口")
-                },
-                leadingContent = { Icon(Icons.Default.SyncAlt, null) },
-                trailingContent = {
-                    Switch(
-                        checked = lyricsProviderEnabled,
-                        onCheckedChange = ::setLyricsProviderEnabled
-                    )
-                },
-                modifier = Modifier.clickable {
-                    setLyricsProviderEnabled(!lyricsProviderEnabled)
-                }
-            )
-            var artworkBeatEnabled by remember {
-                mutableStateOf(preferences.getBoolean("artwork_beat_enabled", true))
-            }
-            ListItem(
-                headlineContent = { Text("专辑节奏跳动") },
-                supportingContent = {
-                    Text("播放时专辑封面跟随低频节奏缩放跳动")
-                },
-                leadingContent = { Icon(Icons.Default.BubbleChart, null) },
-                trailingContent = {
-                    Switch(
-                        checked = artworkBeatEnabled,
-                        onCheckedChange = {
-                            artworkBeatEnabled = it
-                            preferences.edit { putBoolean("artwork_beat_enabled", it) }
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    artworkBeatEnabled = !artworkBeatEnabled
-                    preferences.edit { putBoolean("artwork_beat_enabled", artworkBeatEnabled) }
-                }
-            )
-            var spectrumProgressEnabled by remember {
-                mutableStateOf(preferences.getBoolean("spectrum_progress_enabled", true))
-            }
-            ListItem(
-                headlineContent = { Text("频谱进度条") },
-                supportingContent = {
-                    Text("播放页进度条叠加实时频谱，可随时开关")
-                },
-                leadingContent = { Icon(Icons.Default.GraphicEq, null) },
-                trailingContent = {
-                    Switch(
-                        checked = spectrumProgressEnabled,
-                        onCheckedChange = {
-                            spectrumProgressEnabled = it
-                            preferences.edit { putBoolean("spectrum_progress_enabled", it) }
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    spectrumProgressEnabled = !spectrumProgressEnabled
-                    preferences.edit { putBoolean("spectrum_progress_enabled", spectrumProgressEnabled) }
-                }
-            )
-            var openPlayerOnSongClick by remember {
-                mutableStateOf(preferences.getBoolean("open_player_on_song_click", false))
-            }
-            ListItem(
-                headlineContent = { Text("点击歌曲进入播放页") },
+                headlineContent = { Text(appText("点击歌曲进入播放页", "Open player when selecting a song")) },
                 supportingContent = {
                     Text(
                         if (openPlayerOnSongClick) {
-                            "点击列表歌曲后会进入全屏播放页"
+                            appText("点击歌曲后立即打开播放页", "Open the player immediately after selecting a song")
                         } else {
-                            "点击列表歌曲只播放，不进入播放页（可点底部迷你播放器进入）"
+                            appText("点击歌曲只开始播放，通过迷你播放器进入播放页", "Start playback only; open the player from the mini player")
                         }
                     )
                 },
@@ -2088,52 +2125,50 @@ fun PlaybackSettingsScreen(
                     preferences.edit { putBoolean("open_player_on_song_click", openPlayerOnSongClick) }
                 }
             )
+            SettingsSectionHeader(appText("播放页显示", "Player display"))
             ListItem(
-                headlineContent = { Text("桌面歌词部件") },
+                headlineContent = { Text(appText("专辑节奏跳动", "Artwork beat animation")) },
                 supportingContent = {
-                    Text("长按桌面空白处 → 微件/小部件 → 添加「桌面歌词」，可显示歌词并控制播放")
+                    Text(appText("播放时专辑封面跟随低频节奏缩放跳动", "Scale the artwork with low-frequency energy"))
                 },
-                leadingContent = { Icon(Icons.Default.Widgets, null) }
-            )
-            val audioOutput = rememberAudioOutputSnapshot()
-            ListItem(
-                headlineContent = { Text("当前输出设备") },
-                supportingContent = {
-                    Text(
-                        buildString {
-                            append(audioOutput.summary)
-                            append("\n")
-                            append(audioOutput.latencyLabel)
-                            val details = buildList {
-                                audioOutput.systemLatencyMs?.let { add("系统 ${it}ms") }
-                                audioOutput.bufferLatencyMs?.let { add("缓冲 ${it}ms") }
-                                audioOutput.sampleRateHz?.let { add("${it}Hz") }
-                            }
-                            if (details.isNotEmpty()) {
-                                append("（")
-                                append(details.joinToString(" · "))
-                                append("）")
-                            }
-                            if (audioOutput.allOutputs.size > 1) {
-                                append("\n可用：")
-                                append(audioOutput.allOutputs.joinToString("、"))
-                            }
+                leadingContent = { Icon(Icons.Default.BubbleChart, null) },
+                trailingContent = {
+                    Switch(
+                        checked = artworkBeatEnabled,
+                        onCheckedChange = {
+                            artworkBeatEnabled = it
+                            preferences.edit { putBoolean("artwork_beat_enabled", it) }
                         }
                     )
                 },
-                leadingContent = {
-                    val icon = when {
-                        audioOutput.typeLabel.contains("蓝牙") -> Icons.Default.Bluetooth
-                        audioOutput.typeLabel.contains("USB") -> Icons.Default.Usb
-                        audioOutput.typeLabel.contains("耳机") -> Icons.Default.Headset
-                        else -> Icons.Default.Speaker
-                    }
-                    Icon(icon, contentDescription = null)
+                modifier = Modifier.clickable {
+                    artworkBeatEnabled = !artworkBeatEnabled
+                    preferences.edit { putBoolean("artwork_beat_enabled", artworkBeatEnabled) }
                 }
             )
+            ListItem(
+                headlineContent = { Text(appText("频谱进度条", "Spectrum progress bar")) },
+                supportingContent = {
+                    Text(appText("播放页进度条叠加实时频谱，可随时开关", "Overlay a live spectrum on the player progress bar"))
+                },
+                leadingContent = { Icon(Icons.Default.GraphicEq, null) },
+                trailingContent = {
+                    Switch(
+                        checked = spectrumProgressEnabled,
+                        onCheckedChange = {
+                            spectrumProgressEnabled = it
+                            preferences.edit { putBoolean("spectrum_progress_enabled", it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    spectrumProgressEnabled = !spectrumProgressEnabled
+                    preferences.edit { putBoolean("spectrum_progress_enabled", spectrumProgressEnabled) }
+                }
+            )
+            }
         }
     }
-}
 
 private data class EqualizerPreset(val name: String, val gains: IntArray)
 
@@ -2807,7 +2842,7 @@ fun MD3MiniPlayer(
     onPrevious: () -> Unit,
     onSeek: (Float) -> Unit
 ) {
-    val artwork = rememberArtwork(song)
+    val artwork = rememberArtwork(song, maxPx = 128)
     var sliderPosition by remember(progress) { mutableFloatStateOf(progress) }
 
     Surface(
@@ -2891,18 +2926,18 @@ fun MD3MiniPlayer(
 }
 
 /**
- * 按需加载封面：优先使用 song.artwork；否则在后台解码 artwork/<hash>.png
- * - 单张图片解码，IO 阻塞很短
- * - 使用 key 标识，当 song 变化时重新加载
+ * 按需加载封面：先查尺寸分级内存缓存，再在后台合并磁盘读取请求。
  */
 @Composable
-fun rememberArtwork(song: Song): Bitmap? {
+fun rememberArtwork(song: Song, maxPx: Int = 768): Bitmap? {
     val context = LocalContext.current
-    var loaded by remember(song.uri, song.artwork) { mutableStateOf(song.artwork) }
-    LaunchedEffect(song.uri) {
+    var loaded by remember(song.uri, song.artwork, maxPx) {
+        mutableStateOf(ScanRecordsManager.peekArtwork(song, maxPx))
+    }
+    LaunchedEffect(song.uri, song.artwork, maxPx) {
         if (loaded == null) {
             val bitmap = withContext(Dispatchers.IO) {
-                ScanRecordsManager.loadArtworkAsync(context, song)?.artwork
+                ScanRecordsManager.loadArtworkAsync(context, song, maxPx)?.artwork
             }
             if (bitmap != null) loaded = bitmap
         }
@@ -3119,6 +3154,9 @@ private fun songChangeTransition(
     initialUri: Uri,
     targetUri: Uri
 ): ContentTransform {
+    if (!AppAnimationSettings.enabled) {
+        return EnterTransition.None togetherWith ExitTransition.None
+    }
     val initialIndex = songs.indexOfFirst { it.uri == initialUri }
     val targetIndex = songs.indexOfFirst { it.uri == targetUri }
     val direction = if (targetIndex < 0 || initialIndex < 0 || targetIndex >= initialIndex) 1 else -1
@@ -3141,9 +3179,6 @@ fun FullPlayerScreen(
     onScratchEnd: (Long) -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
-    onBack: () -> Unit,
-    onExitFullscreenMode: () -> Unit,
-    fullscreenPlayerMode: Boolean,
     context: android.content.Context,
     musicDirectories: List<Uri>,
     songs: List<Song>,
@@ -3152,14 +3187,20 @@ fun FullPlayerScreen(
     onRepeatModeChange: () -> Unit,
     shuffleMode: Boolean,
     onShuffleModeChange: () -> Unit,
-    isLandscape: Boolean
+    isLandscape: Boolean,
+    floatingDockVisible: Boolean
 ) {
     val configuration = LocalConfiguration.current
     val artworkSize = if (isLandscape) minOf(220, (configuration.screenHeightDp * 0.34f).toInt()).dp else 300.dp
     val pagePadding = if (isLandscape) 16.dp else 32.dp
     val sectionPadding = if (isLandscape) 4.dp else 16.dp
-    var dismissDragOffset by remember { mutableFloatStateOf(0f) }
-    var dismissGestureActive by remember { mutableStateOf(false) }
+    val dockControlPadding = if (!floatingDockVisible) {
+        0.dp
+    } else if (isLandscape) {
+        70.dp
+    } else {
+        48.dp
+    }
     var showLyrics by remember { mutableStateOf(false) }
     var quickListExpanded by remember { mutableStateOf(false) }
     var sliderPosition by remember { mutableFloatStateOf(0f) }
@@ -3170,10 +3211,11 @@ fun FullPlayerScreen(
     var lastDragTime by remember { mutableLongStateOf(0L) }
     var lastScratchDispatchTime by remember { mutableLongStateOf(0L) }
     LaunchedEffect(position, duration) { if (!isDragging) sliderPosition = if (duration > 0) position.toFloat() / duration else 0f }
-    LaunchedEffect(isDjMode, isPlaying, isDragging) {
-        while (isDjMode && isPlaying && !isDragging) {
+    val animationsEnabled = AppAnimationSettings.enabled
+    LaunchedEffect(isDjMode, isPlaying, isDragging, animationsEnabled) {
+        while (animationsEnabled && isDjMode && isPlaying && !isDragging) {
             turntableRotation = (turntableRotation + 1.8f) % 360f
-            delay(SmoothAnimationFrameRate.frameDelayMillis)
+            delay(16L)
         }
     }
 
@@ -3193,10 +3235,13 @@ fun FullPlayerScreen(
         artworkBeatEnabled = playerPrefs.getBoolean("artwork_beat_enabled", true)
         spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
     }
-    val beatEnergy = rememberBeatEnergy(isPlaying = isPlaying, enabled = artworkBeatEnabled)
+    val beatEnergy = rememberBeatEnergy(
+        isPlaying = isPlaying,
+        enabled = artworkBeatEnabled && animationsEnabled
+    )
     val beatScale by animateFloatAsState(
         targetValue = beatScaleFromEnergy(beatEnergy),
-        animationSpec = tween(durationMillis = 100),
+        animationSpec = tween(durationMillis = if (animationsEnabled) 100 else 0),
         label = "ArtworkBeatScale"
     )
     // 按需加载音频格式信息（采样率/比特率），不阻塞主线程
@@ -3224,42 +3269,18 @@ fun FullPlayerScreen(
     }
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .graphicsLayer {
-                translationY = dismissDragOffset
-                alpha = (1f - dismissDragOffset / (size.height.coerceAtLeast(1f) * 1.5f)).coerceIn(0.72f, 1f)
-            }
-            .pointerInput(onBack) {
-                detectVerticalDragGestures(
-                    onDragStart = { start ->
-                        dismissGestureActive = start.y <= size.height * 0.32f
-                        dismissDragOffset = 0f
-                    },
-                    onVerticalDrag = { change, amount ->
-                        if (dismissGestureActive) {
-                            change.consume()
-                            dismissDragOffset = (dismissDragOffset + amount).coerceAtLeast(0f)
-                        }
-                    },
-                    onDragEnd = {
-                        if (dismissGestureActive && dismissDragOffset >= 120.dp.toPx()) onBack()
-                        dismissDragOffset = 0f
-                        dismissGestureActive = false
-                    },
-                    onDragCancel = {
-                        dismissDragOffset = 0f
-                        dismissGestureActive = false
-                    }
-                )
-            }
+        modifier = Modifier.fillMaxSize()
     ) {
         // 背景层随歌曲封面交叉渐变，避免切歌时瞬间跳变。
         AnimatedContent(
             targetState = song.uri,
             modifier = Modifier.fillMaxSize(),
             transitionSpec = {
-                fadeIn(tween(700)) togetherWith fadeOut(tween(700))
+                if (animationsEnabled) {
+                    fadeIn(tween(700)) togetherWith fadeOut(tween(700))
+                } else {
+                    EnterTransition.None togetherWith ExitTransition.None
+                }
             },
             label = "PlayerBackgroundTransition"
         ) { targetUri ->
@@ -3281,7 +3302,11 @@ fun FullPlayerScreen(
         }
         if (isLandscape) {
             Column(
-                modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 24.dp, vertical = 8.dp)
+                modifier = Modifier
+                    .fillMaxSize()
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                    .padding(horizontal = 24.dp, vertical = 8.dp)
+                    .padding(bottom = dockControlPadding)
             ) {
                 Row(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -3291,21 +3316,6 @@ fun FullPlayerScreen(
                         modifier = Modifier.weight(0.42f).fillMaxHeight(),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Row(Modifier.fillMaxWidth()) {
-                            IconButton(
-                                onClick = if (fullscreenPlayerMode) onExitFullscreenMode else onBack
-                            ) {
-                                Icon(
-                                    imageVector = if (fullscreenPlayerMode) {
-                                        Icons.Default.FullscreenExit
-                                    } else {
-                                        Icons.Default.KeyboardArrowDown
-                                    },
-                                    contentDescription = if (fullscreenPlayerMode) "退出全屏模式" else "返回",
-                                    modifier = Modifier.size(30.dp)
-                                )
-                            }
-                        }
                         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                             AnimatedContent(
                                 targetState = song.uri,
@@ -3395,29 +3405,23 @@ fun FullPlayerScreen(
                 }
             }
         } else {
-        Column(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(pagePadding), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
-            // 顶部：仅返回按钮
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(
-                    onClick = if (fullscreenPlayerMode) onExitFullscreenMode else onBack
-                ) {
-                    Icon(
-                        imageVector = if (fullscreenPlayerMode) {
-                            Icons.Default.FullscreenExit
-                        } else {
-                            Icons.Default.KeyboardArrowDown
-                        },
-                        contentDescription = if (fullscreenPlayerMode) "退出全屏模式" else "返回",
-                        modifier = Modifier.size(32.dp)
-                    )
-                }
-            }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(pagePadding)
+                .padding(bottom = dockControlPadding),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
             // 中部：歌词/专辑，带切换动画
             Box(Modifier.weight(1f).fillMaxWidth(), Alignment.Center) {
                 AnimatedContent(
                     targetState = showLyrics to song.uri,
                     transitionSpec = {
-                        if (initialState.first != targetState.first) {
+                        if (!animationsEnabled) {
+                            EnterTransition.None togetherWith ExitTransition.None
+                        } else if (initialState.first != targetState.first) {
                             (fadeIn(animationSpec = tween(400)) + scaleIn(initialScale = 0.92f)) togetherWith
                                 fadeOut(animationSpec = tween(400))
                         } else {
@@ -3782,7 +3786,7 @@ fun LyricView(
     onSeek: (Long) -> Unit
 ) {
     if (lyrics.isEmpty()) {
-        Box(Modifier.fillMaxSize(), Alignment.Center) { Text("未找到歌词", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Box(Modifier.fillMaxSize(), Alignment.Center) { Text(appText("未找到歌词", "No lyrics found"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
         return
     }
     val lineIdx = lyrics.indexOfLast { it.first <= currentPosition }

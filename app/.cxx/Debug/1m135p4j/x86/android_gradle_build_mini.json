@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "E:\\DProject\\WANmusic\\app\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "E:\\SDK\\ANDROID\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "E:\\DProject\\WANmusic\\app\\.cxx\\Debug\\1m135p4j\\x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "E:\\SDK\\ANDROID\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "E:\\DProject\\WANmusic\\app\\.cxx\\Debug\\1m135p4j\\x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "wan_audio_output::@6890427a1f51a3e7e1df": {
+      "artifactName": "wan_audio_output",
+      "abi": "x86",
+      "output": "E:\\DProject\\WANmusic\\app\\build\\intermediates\\cxx\\Debug\\1m135p4j\\obj\\x86\\libwan_audio_output.so",
+      "runtimeFiles": []
+    }
+  }
+}

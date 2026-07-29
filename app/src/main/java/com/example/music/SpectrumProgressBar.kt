@@ -42,13 +42,14 @@ fun rememberSpectrumBars(
     enabled: Boolean,
     barCount: Int = 48
 ): FloatArray {
+    val effectiveEnabled = enabled && AppAnimationSettings.enabled
     var bars by remember(barCount) { mutableStateOf(FloatArray(barCount)) }
     var sessionId by remember { mutableIntStateOf(AudioSessionHolder.sessionId) }
     var useVisualizer by remember { mutableStateOf(false) }
     val smoothed = remember(barCount) { FloatArray(barCount) }
 
-    LaunchedEffect(isPlaying, enabled) {
-        while (enabled) {
+    LaunchedEffect(isPlaying, effectiveEnabled) {
+        while (effectiveEnabled) {
             val id = AudioSessionHolder.sessionId
             if (id != sessionId) {
                 sessionId = id
@@ -58,8 +59,8 @@ fun rememberSpectrumBars(
         }
     }
 
-    DisposableEffect(enabled, barCount) {
-        if (!enabled) {
+    DisposableEffect(effectiveEnabled, barCount) {
+        if (!effectiveEnabled) {
             bars = FloatArray(barCount)
             useVisualizer = false
             onDispose { }
@@ -85,14 +86,14 @@ fun rememberSpectrumBars(
             useVisualizer = SharedAudioVisualizer.isAttached
             onDispose {
                 SharedAudioVisualizer.removeListener(listener)
-                if (!enabled) bars = FloatArray(barCount)
+                if (!effectiveEnabled) bars = FloatArray(barCount)
             }
         }
     }
 
     // 合成频谱兜底
-    LaunchedEffect(isPlaying, enabled, useVisualizer, sessionId, barCount) {
-        if (!enabled) {
+    LaunchedEffect(isPlaying, effectiveEnabled, useVisualizer, sessionId, barCount) {
+        if (!effectiveEnabled) {
             bars = FloatArray(barCount)
             return@LaunchedEffect
         }
@@ -129,11 +130,11 @@ fun rememberSpectrumBars(
                 if (raw > prev) prev * 0.3f + raw * 0.7f else prev * 0.75f + raw * 0.25f
             }
             bars = blended
-            delay(SmoothAnimationFrameRate.frameDelayMillis)
+            delay(16L)
         }
     }
 
-    return if (enabled) bars else FloatArray(barCount)
+    return if (effectiveEnabled) bars else FloatArray(barCount)
 }
 
 /** 将 FFT 映射为对数频段频谱条 */
