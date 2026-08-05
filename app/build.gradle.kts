@@ -4,6 +4,16 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val generatedVersionCode = providers.gradleProperty("WAN_VERSION_CODE")
+    .orNull
+    ?.toIntOrNull()
+    ?.coerceAtLeast(1)
+    ?: 1
+val generatedVersionName = providers.gradleProperty("WAN_VERSION_NAME")
+    .orNull
+    ?.takeIf { it.isNotBlank() }
+    ?: "1.0"
+
 android {
     namespace = "com.example.music"
     compileSdk = 36
@@ -12,8 +22,8 @@ android {
         applicationId = "com.example.music"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = generatedVersionCode
+        versionName = generatedVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

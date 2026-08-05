@@ -1,18 +1,13 @@
 package com.example.music
 
 import android.annotation.SuppressLint
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
@@ -39,8 +34,6 @@ import kotlinx.coroutines.launch
 class OverlayLyricsService : Service() {
 
     companion object {
-        private const val CHANNEL_ID = "overlay_lyrics_channel"
-        private const val NOTIFICATION_ID = 7701
         private const val ACTION_STOP = "com.example.music.OVERLAY_STOP"
         private const val PREFS = "music_prefs"
         private const val KEY_ENABLED = "overlay_lyrics_enabled"
@@ -53,10 +46,11 @@ class OverlayLyricsService : Service() {
 
         fun start(context: Context) {
             val intent = Intent(context, OverlayLyricsService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
+            runCatching {
+                // PlaybackService already keeps this process in foreground while music is active.
                 context.startService(intent)
+            }.onFailure {
+                android.util.Log.e("OverlayLyrics", "Unable to start overlay service", it)
             }
         }
 
@@ -78,7 +72,11 @@ class OverlayLyricsService : Service() {
                 .getBoolean(KEY_ENABLED, false)
 
         fun startIfEnabled(context: Context) {
-            if (isEnabled(context) && Settings.canDrawOverlays(context) && !isRunning()) {
+            if (
+                isEnabled(context) &&
+                Settings.canDrawOverlays(context) &&
+                !isRunning()
+            ) {
                 start(context)
             }
         }
@@ -92,16 +90,31 @@ class OverlayLyricsService : Service() {
     private var lastSignature: String = ""
     private var mediaController: MediaController? = null
 
+    private fun clampOverlayPosition() {
+        val wm = windowManager ?: return
+        val view = overlayView ?: return
+        val lp = layoutParams ?: return
+        val bounds = android.graphics.Rect()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRectSize(bounds)
+        val statusBarHeight = resources.getIdentifier("status_bar_height", "dimen", "android")
+            .takeIf { it != 0 }
+            ?.let(resources::getDimensionPixelSize)
+            ?: 0
+        val maxX = (bounds.width() - view.width).coerceAtLeast(0)
+        val maxY = (bounds.height() - view.height).coerceAtLeast(statusBarHeight)
+        lp.x = lp.x.coerceIn(0, maxX)
+        lp.y = lp.y.coerceIn(statusBarHeight, maxY)
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        startAsForeground()
         LyricsStateHolder._overlayRunning = true
         connectMediaController()
 
         if (!Settings.canDrawOverlays(this)) {
-            setEnabled(this, false)
+            LyricsStateHolder._overlayRunning = false
             stopSelf()
             return
         }
@@ -120,8 +133,8 @@ class OverlayLyricsService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = prefs.getInt(KEY_POS_X, 48)
-            y = prefs.getInt(KEY_POS_Y, 220)
+            x = prefs.getInt(KEY_POS_X, 48).coerceAtLeast(0)
+            y = prefs.getInt(KEY_POS_Y, 220).coerceAtLeast(0)
         }
         layoutParams = params
 
@@ -148,6 +161,7 @@ class OverlayLyricsService : Service() {
                     if (kotlin.math.abs(dx) > 4 || kotlin.math.abs(dy) > 4) moved = true
                     lp.x = initialX + dx
                     lp.y = initialY + dy
+                    clampOverlayPosition()
                     try {
                         windowManager?.updateViewLayout(overlayView, lp)
                     } catch (_: Exception) {
@@ -169,8 +183,13 @@ class OverlayLyricsService : Service() {
 
         try {
             windowManager?.addView(overlayView, params)
+            overlayView?.post {
+                clampOverlayPosition()
+                runCatching { windowManager?.updateViewLayout(overlayView, params) }
+            }
         } catch (e: Exception) {
             android.util.Log.e("OverlayLyrics", "Failed to add overlay view", e)
+            LyricsStateHolder._overlayRunning = false
             stopSelf()
             return
         }
@@ -189,19 +208,6 @@ class OverlayLyricsService : Service() {
             }, MoreExecutors.directExecutor())
         }.onFailure {
             android.util.Log.w("OverlayLyrics", "MediaController connect failed", it)
-        }
-    }
-
-    private fun startAsForeground() {
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
         }
     }
 
@@ -283,6 +289,16 @@ class OverlayLyricsService : Service() {
         return START_STICKY
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        overlayView?.post {
+            clampOverlayPosition()
+            layoutParams?.let { params ->
+                runCatching { windowManager?.updateViewLayout(overlayView, params) }
+            }
+        }
+    }
+
     override fun onDestroy() {
         updateJob?.cancel()
         scope.cancel()
@@ -301,55 +317,4 @@ class OverlayLyricsService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.overlay_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.overlay_channel_desc)
-                setShowBadge(false)
-            }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
-    private fun buildNotification(): Notification {
-        val stopIntent = Intent(this, OverlayLyricsService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPending = PendingIntent.getService(
-            this,
-            0,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-        }
-        val openPending = PendingIntent.getActivity(
-            this,
-            0,
-            openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-        return builder
-            .setContentTitle(getString(R.string.overlay_notification_title))
-            .setContentText(getString(R.string.overlay_notification_text))
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentIntent(openPending)
-            .addAction(
-                Notification.Action.Builder(null, getString(R.string.overlay_action_close), stopPending).build()
-            )
-            .setOngoing(true)
-            .build()
-    }
 }

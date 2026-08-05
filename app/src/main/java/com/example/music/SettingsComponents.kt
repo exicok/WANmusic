@@ -9,9 +9,12 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+
+val LocalDockContentPadding = staticCompositionLocalOf { 0.dp }
 
 @Composable
 fun SettingsItem(label: String, icon: ImageVector, onClick: () -> Unit) {

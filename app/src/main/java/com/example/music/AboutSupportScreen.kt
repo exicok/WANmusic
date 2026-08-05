@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -36,6 +37,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun AboutSupportScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val dockContentPadding = LocalDockContentPadding.current
     val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
     val versionName = packageInfo.versionName ?: "1.0"
 
@@ -64,6 +66,7 @@ fun AboutSupportScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
+            contentPadding = PaddingValues(bottom = dockContentPadding),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             item {

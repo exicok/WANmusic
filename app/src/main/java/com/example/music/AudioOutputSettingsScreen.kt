@@ -40,6 +40,7 @@ import kotlin.math.roundToInt
 @Composable
 fun AudioOutputSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val dockContentPadding = LocalDockContentPadding.current
     val preferences = remember {
         context.getSharedPreferences(AudioOutputConfig.PREFS_NAME, Context.MODE_PRIVATE)
     }
@@ -98,6 +99,7 @@ fun AudioOutputSettingsScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
+                .padding(bottom = dockContentPadding)
         ) {
             SettingsSectionHeader(appText("当前输出", "Current output"))
             ListItem(

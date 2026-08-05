@@ -1,0 +1,100 @@
+name: Android Cloud Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Optional version name, for example 1.2.0"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate automatic version
+        id: version
+        shell: bash
+        env:
+          MANUAL_VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+
+          if [[ -n "${MANUAL_VERSION_NAME}" ]]; then
+            VERSION_NAME="${MANUAL_VERSION_NAME}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          else
+            VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+          fi
+
+          SAFE_VERSION_NAME="$(echo "${VERSION_NAME}" | tr '/ :+' '----')"
+          echo "version_code=${VERSION_CODE}" >> "${GITHUB_OUTPUT}"
+          echo "version_name=${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "safe_version_name=${SAFE_VERSION_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "Generated versionCode=${VERSION_CODE}, versionName=${VERSION_NAME}"
+
+      - name: Grant Gradle wrapper permission
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: >-
+          ./gradlew :app:assembleDebug
+          --stacktrace
+          -PWAN_VERSION_CODE=${{ steps.version.outputs.version_code }}
+          -PWAN_VERSION_NAME=${{ steps.version.outputs.version_name }}
+
+      - name: Prepare APK artifact
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "release-artifacts/WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}
+          path: release-artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release for version tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WANmusic ${{ steps.version.outputs.version_name }}
+          generate_release_notes: true
+          files: release-artifacts/*.apk

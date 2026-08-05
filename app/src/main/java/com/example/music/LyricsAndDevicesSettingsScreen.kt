@@ -39,6 +39,7 @@ import androidx.lifecycle.LifecycleEventObserver
 @Composable
 fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val dockContentPadding = LocalDockContentPadding.current
     val preferences = remember {
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
     }
@@ -63,7 +64,7 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
                 overlayEnabled = OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning()
                 if (OverlayLyricsService.isEnabled(context) && canDrawOverlays) {
                     OverlayLyricsService.startIfEnabled(context)
-                    overlayEnabled = true
+                    overlayEnabled = OverlayLyricsService.isEnabled(context)
                 }
             }
         }
@@ -84,8 +85,13 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
             return
         }
         OverlayLyricsService.setEnabled(context, enabled)
-        if (enabled) OverlayLyricsService.start(context) else OverlayLyricsService.stop(context)
-        overlayEnabled = enabled
+        if (enabled) {
+            OverlayLyricsService.start(context)
+            overlayEnabled = OverlayLyricsService.isEnabled(context)
+        } else {
+            OverlayLyricsService.stop(context)
+            overlayEnabled = false
+        }
     }
 
     fun setLyricsProviderEnabled(enabled: Boolean) {
@@ -97,7 +103,7 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("歌词与外部设备") },
+                title = { Text("外部设备与服务") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
@@ -110,8 +116,9 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
             modifier = Modifier
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
+                .padding(bottom = dockContentPadding)
         ) {
-            SettingsSectionHeader("显示")
+            SettingsSectionHeader("悬浮显示")
             ListItem(
                 headlineContent = { Text("悬浮歌词") },
                 supportingContent = {
