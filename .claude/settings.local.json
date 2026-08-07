@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/USER/Administrator/.gradle/caches/modules-2/files-2.1/androidx.media3/**)",
+      "Read(//e//**)",
+      "Bash(find 'D:\\\\USER\\\\Administrator/.gradle/caches/modules-2/files-2.1/androidx.media3/media3-session' -name *.aar -o -name *sources*)",
+      "Read(//tmp/**)",
+      "Bash(unzip -o -q 'D:\\\\USER\\\\Administrator/.gradle/caches/modules-2/files-2.1/androidx.media3/media3-session/1.5.1/*/media3-session-1.5.1-sources.jar' -d session)",
+      "Bash(./gradlew compileDebugKotlin --offline -q)"
+    ]
+  }
+}

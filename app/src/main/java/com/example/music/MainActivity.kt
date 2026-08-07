@@ -37,8 +37,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -120,6 +122,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.first
 
 // Config Persistence Helper
 object ConfigManager {
@@ -616,6 +619,11 @@ class MainActivity : ComponentActivity() {
             window.isNavigationBarContrastEnforced = false
         }
         setContent {
+            remember(this) {
+                AlbumDotMatrixSettings.load(this)
+                MusicLibraryStyleSettings.load(this)
+                true
+            }
             var dockPosition by remember { mutableStateOf(prefs.getString("dock_position", "bottom") ?: "bottom") }
             var isAmoledMode by remember { mutableStateOf(savedAmoledMode) }
             var isDjMode by remember { mutableStateOf(savedDjMode) }
@@ -627,15 +635,15 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(playerLandscape) { prefs.edit { putBoolean("player_landscape", playerLandscape) } }
 
             MusicTheme(dynamicColor = false, amoledMode = isAmoledMode) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    val err = initError
-                    val currentPlayer = player
-                    when {
-                        err != null -> StartupErrorScreen(err)
-                        currentPlayer != null -> MusicApp(
+                    Surface(
+                        modifier = Modifier.fillMaxSize(),
+                        color = MaterialTheme.colorScheme.background
+                    ) {
+                        val err = initError
+                        val currentPlayer = player
+                        when {
+                            err != null -> StartupErrorScreen(err)
+                            currentPlayer != null -> MusicApp(
                             player = currentPlayer,
                             initialDirs = savedDirs,
                             initialSongs = savedSongs,
@@ -651,15 +659,15 @@ class MainActivity : ComponentActivity() {
                             initialLastUri = lastUri,
                             initialLastPosition = lastPosition,
                             initialLastDuration = lastDuration
-                        )
-                        else -> Box(Modifier.fillMaxSize(), Alignment.Center) {
-                            CircularProgressIndicator()
+                            )
+                            else -> Box(Modifier.fillMaxSize(), Alignment.Center) {
+                                CircularProgressIndicator()
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -1052,8 +1060,9 @@ fun MusicApp(
     ) {
         val isFloatDock = dockPosition.equals("float", ignoreCase = true)
         val dockScreens = setOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
-        val showDock = currentScreen in dockScreens || isFloatDock
-        val floatOverlayActive = isFloatDock
+        val hideDockForLandscapePlayer = currentScreen == Screen.PlayerView && playerLandscape
+        val showDock = (currentScreen in dockScreens || isFloatDock) && !hideDockForLandscapePlayer
+        val floatOverlayActive = isFloatDock && !hideDockForLandscapePlayer
         val floatDockHasMiniPlayer = currentSong != null && currentScreen != Screen.PlayerView
         // 覆盖迷你播放器/导航栏、手势导航区及外边距，确保任何页面内容都位于 Dock 上方。
         val floatingDockSpace = if (floatDockHasMiniPlayer) 184.dp else 108.dp
@@ -1186,6 +1195,7 @@ fun MusicApp(
                                     },
                                     shuffleMode = shuffleMode,
                                     onShuffleModeChange = { shuffleMode = !shuffleMode },
+                                    onBack = handleBack,
                                     isLandscape = playerLandscape,
                                     floatingDockVisible = floatOverlayActive,
                                     fixedDockBottomPadding = if (showFixedBottomBar) {
@@ -1256,6 +1266,15 @@ fun MusicApp(
                             isAmoledMode = isAmoledMode,
                             onAmoledModeChange = onAmoledModeChange,
                             onNavigate = { currentScreen = it }
+                        )
+                        Screen.Personalization -> PersonalizationSettingsScreen(
+                            dockPosition = dockPosition,
+                            onDockPositionChange = onDockPositionChange,
+                            playerLandscape = playerLandscape,
+                            onPlayerLandscapeChange = onPlayerLandscapeChange,
+                            isAmoledMode = isAmoledMode,
+                            onAmoledModeChange = onAmoledModeChange,
+                            onBack = handleBack
                         )
                         Screen.Library -> LibrarySettingsScreen(
                             directories = musicDirectories,
@@ -1365,14 +1384,17 @@ fun LocalMusicScreen(
     protectStatusBarContent: Boolean = true
 ) {
     val context = LocalContext.current
+    val deckStyleEnabled = MusicLibraryStyleSettings.deckStyleEnabled
     val savedScroll = remember { ListScrollMemory.load(context) }
     val listState = rememberLazyListState(
         initialFirstVisibleItemIndex = savedScroll.first,
         initialFirstVisibleItemScrollOffset = savedScroll.second
     )
+    val listSnapBehavior = rememberSnapFlingBehavior(lazyListState = listState)
     var draggingItemIndex by remember { mutableStateOf<Int?>(null) }
     var dragOffset by remember { mutableFloatStateOf(0f) }
     var detailSong by remember { mutableStateOf<Song?>(null) }
+    var centeredSongIndex by remember { mutableIntStateOf(savedScroll.first.coerceAtLeast(0)) }
 
     // 记录滑动位置，返回音乐页时恢复
     LaunchedEffect(listState, songs.size) {
@@ -1395,6 +1417,24 @@ fun LocalMusicScreen(
         if (listState.firstVisibleItemIndex > maxIndex) {
             listState.scrollToItem(maxIndex)
         }
+    }
+
+    LaunchedEffect(listState, songs.size, deckStyleEnabled) {
+        if (!deckStyleEnabled) return@LaunchedEffect
+        snapshotFlow {
+            val layoutInfo = listState.layoutInfo
+            val viewportCenter =
+                (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
+            layoutInfo.visibleItemsInfo.minByOrNull { item ->
+                kotlin.math.abs(item.offset + item.size / 2 - viewportCenter)
+            }?.index
+        }
+            .distinctUntilChanged()
+            .collectLatest { centeredIndex ->
+                if (centeredIndex != null && centeredIndex in songs.indices) {
+                    centeredSongIndex = centeredIndex
+                }
+            }
     }
 
     Box(
@@ -1440,86 +1480,161 @@ fun LocalMusicScreen(
                         Text(appText("暂无本地音乐", "No local music"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
+            } else if (!deckStyleEnabled) {
+                TraditionalMusicList(
+                    songs = songs,
+                    listState = listState,
+                    bottomContentPadding = bottomContentPadding,
+                    onSongClick = onSongClick,
+                    onSongLongClick = { detailSong = it },
+                    onReorder = onReorder
+                )
             } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = bottomContentPadding)
-                ) {
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val cardExtent = 142.dp
+                    val centerPadding = ((maxHeight - cardExtent) / 2).coerceAtLeast(24.dp)
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        flingBehavior = listSnapBehavior,
+                        contentPadding = PaddingValues(
+                            top = centerPadding,
+                            bottom = bottomContentPadding + centerPadding
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                     itemsIndexed(songs, key = { _, song -> song.uri.toString() }) { index, song ->
                         val artwork = rememberArtwork(song, maxPx = 96)
                         val isDragging = index == draggingItemIndex
+                        val isCentered = index == centeredSongIndex
+                        val centerDistance = (index - centeredSongIndex).coerceIn(-3, 3)
+                        var playSwipeOffset by remember(song.uri) { mutableFloatStateOf(0f) }
+                        val playSwipeThreshold = with(LocalDensity.current) { 72.dp.toPx() }
                         
                         ListItem(
                             modifier = Modifier
+                                .fillMaxWidth()
                                 .graphicsLayer {
                                     translationY = if (isDragging) dragOffset else 0f
-                                    alpha = if (isDragging) 0.8f else 1.0f
-                                    scaleX = if (isDragging) 1.02f else 1.0f
-                                    scaleY = if (isDragging) 1.02f else 1.0f
+                                    translationX = playSwipeOffset + kotlin.math.abs(centerDistance) * 18.dp.toPx()
+                                    rotationZ = -centerDistance * 5.5f
+                                    alpha = if (isDragging) 0.8f else if (isCentered) 1f else 0.58f
+                                    scaleX = if (isDragging) 1.02f else if (isCentered) 1f else 0.88f
+                                    scaleY = if (isDragging) 1.02f else if (isCentered) 1f else 0.88f
                                     shadowElevation = if (isDragging) 8f else 0f
+                                }
+                                .padding(horizontal = if (isCentered) 16.dp else 28.dp, vertical = 7.dp)
+                                .height(128.dp)
+                                .clip(RoundedCornerShape(22.dp))
+                                .background(
+                                    if (isCentered) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
+                                    else MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.24f)
+                                )
+                                .border(
+                                    1.dp,
+                                    if (isCentered) Color.White.copy(alpha = 0.42f)
+                                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.24f),
+                                    RoundedCornerShape(22.dp)
+                                )
+                                .pointerInput(song.uri, isCentered) {
+                                    if (!isCentered) return@pointerInput
+                                    detectHorizontalDragGestures(
+                                        onDragEnd = {
+                                            if (playSwipeOffset >= playSwipeThreshold) onSongClick(song)
+                                            playSwipeOffset = 0f
+                                        },
+                                        onDragCancel = { playSwipeOffset = 0f }
+                                    ) { change, dragAmount ->
+                                        if (dragAmount > 0f || playSwipeOffset > 0f) {
+                                            change.consume()
+                                            playSwipeOffset = (playSwipeOffset + dragAmount)
+                                                .coerceIn(0f, playSwipeThreshold * 1.35f)
+                                        }
+                                    }
                                 }
                                 .combinedClickable(
                                     enabled = draggingItemIndex == null,
-                                    onClick = { onSongClick(song) },
+                                    onClick = {},
                                     onLongClick = { detailSong = song }
                                 ),
-                            headlineContent = { Text(song.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            supportingContent = { Text(song.artist) },
-                            leadingContent = {
-                                if (artwork != null) {
-                                    androidx.compose.foundation.Image(
-                                        artwork.asImageBitmap(),
-                                        null,
-                                        Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)),
-                                        contentScale = ContentScale.Crop
-                                    )
-                                } else Icon(Icons.Default.MusicNote, null)
-                            },
-                            trailingContent = {
-                                Icon(
-                                    Icons.Default.DragHandle,
-                                    contentDescription = appText("拖动排序", "Drag to reorder"),
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .padding(4.dp)
-                                        .pointerInput(Unit) {
-                                            detectDragGesturesAfterLongPress(
-                                                onDragStart = { offset ->
-                                                    draggingItemIndex = index
-                                                    dragOffset = 0f
-                                                },
-                                                onDrag = { change, dragAmount ->
-                                                    change.consume()
-                                                    dragOffset += dragAmount.y
-                                                    
-                                                    // 简单的位移计算，触发位置交换
-                                                    val threshold = 50f
-                                                    if (dragOffset > threshold && index < songs.lastIndex) {
-                                                        onReorder(index, index + 1)
-                                                        draggingItemIndex = index + 1
-                                                        dragOffset -= 64.dp.toPx() // 大致项高度
-                                                    } else if (dragOffset < -threshold && index > 0) {
-                                                        onReorder(index, index - 1)
-                                                        draggingItemIndex = index - 1
-                                                        dragOffset += 64.dp.toPx()
-                                                    }
-                                                },
-                                                onDragEnd = {
-                                                    draggingItemIndex = null
-                                                    dragOffset = 0f
-                                                },
-                                                onDragCancel = {
-                                                    draggingItemIndex = null
-                                                    dragOffset = 0f
-                                                }
-                                            )
-                                        },
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                            headlineContent = {
+                                Text(
+                                    song.title,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = if (isCentered) MaterialTheme.typography.headlineSmall
+                                    else MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.Bold
                                 )
                             },
+                            supportingContent = { Text(song.artist, style = MaterialTheme.typography.titleMedium) },
+                            trailingContent = {
+                                Box(
+                                    modifier = Modifier.size(100.dp),
+                                    contentAlignment = Alignment.CenterEnd
+                                ) {
+                                    if (artwork != null) {
+                                        androidx.compose.foundation.Image(
+                                            bitmap = artwork.asImageBitmap(),
+                                            contentDescription = null,
+                                            modifier = Modifier
+                                                .size(if (isCentered) 92.dp else 78.dp)
+                                                .clip(RoundedCornerShape(18.dp)),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    } else {
+                                        Icon(
+                                            Icons.Default.MusicNote,
+                                            contentDescription = null,
+                                            modifier = Modifier
+                                                .align(Alignment.CenterEnd)
+                                                .size(if (isCentered) 64.dp else 54.dp)
+                                        )
+                                    }
+                                    Icon(
+                                        Icons.Default.DragHandle,
+                                        contentDescription = appText("拖动排序", "Drag to reorder"),
+                                        modifier = Modifier
+                                            .align(Alignment.BottomStart)
+                                            .size(28.dp)
+                                            .padding(4.dp)
+                                            .pointerInput(song.uri) {
+                                                detectDragGesturesAfterLongPress(
+                                                    onDragStart = {
+                                                        draggingItemIndex = index
+                                                        dragOffset = 0f
+                                                    },
+                                                    onDrag = { change, dragAmount ->
+                                                        change.consume()
+                                                        dragOffset += dragAmount.y
+
+                                                        val threshold = 50f
+                                                        if (dragOffset > threshold && index < songs.lastIndex) {
+                                                            onReorder(index, index + 1)
+                                                            draggingItemIndex = index + 1
+                                                            dragOffset -= 142.dp.toPx()
+                                                        } else if (dragOffset < -threshold && index > 0) {
+                                                            onReorder(index, index - 1)
+                                                            draggingItemIndex = index - 1
+                                                            dragOffset += 142.dp.toPx()
+                                                        }
+                                                    },
+                                                    onDragEnd = {
+                                                        draggingItemIndex = null
+                                                        dragOffset = 0f
+                                                    },
+                                                    onDragCancel = {
+                                                        draggingItemIndex = null
+                                                        dragOffset = 0f
+                                                    }
+                                                )
+                                            },
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.48f)
+                                    )
+                                }
+                            },
                             colors = ListItemDefaults.colors(
-                                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)
+                                containerColor = Color.Transparent
                             )
                         )
                     }
@@ -1534,6 +1649,128 @@ fun LocalMusicScreen(
             context = context,
             onDismiss = { detailSong = null }
         )
+    }
+}
+}
+
+@OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class
+)
+@Composable
+private fun TraditionalMusicList(
+    songs: List<Song>,
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    bottomContentPadding: androidx.compose.ui.unit.Dp,
+    onSongClick: (Song) -> Unit,
+    onSongLongClick: (Song) -> Unit,
+    onReorder: (Int, Int) -> Unit
+) {
+    var draggingItemIndex by remember { mutableStateOf<Int?>(null) }
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = bottomContentPadding)
+    ) {
+        itemsIndexed(songs, key = { _, song -> song.uri.toString() }) { index, song ->
+            val artwork = rememberArtwork(song, maxPx = 96)
+            val isDragging = draggingItemIndex == index
+            ListItem(
+                modifier = Modifier
+                    .graphicsLayer {
+                        translationY = if (isDragging) dragOffset else 0f
+                        alpha = if (isDragging) 0.82f else 1f
+                        scaleX = if (isDragging) 1.02f else 1f
+                        scaleY = if (isDragging) 1.02f else 1f
+                        shadowElevation = if (isDragging) 8f else 0f
+                    }
+                    .combinedClickable(
+                        enabled = draggingItemIndex == null,
+                        onClick = { onSongClick(song) },
+                        onLongClick = { onSongLongClick(song) }
+                    ),
+                headlineContent = {
+                    Text(
+                        text = song.title,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                },
+                supportingContent = {
+                    Text(
+                        text = song.artist,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                leadingContent = {
+                    if (artwork != null) {
+                        androidx.compose.foundation.Image(
+                            bitmap = artwork.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Surface(
+                            modifier = Modifier.size(56.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Default.MusicNote, contentDescription = null)
+                            }
+                        }
+                    }
+                },
+                trailingContent = {
+                    Icon(
+                        imageVector = Icons.Default.DragHandle,
+                        contentDescription = appText("拖动排序", "Drag to reorder"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                        modifier = Modifier
+                            .size(32.dp)
+                            .padding(4.dp)
+                            .pointerInput(song.uri) {
+                                detectDragGesturesAfterLongPress(
+                                    onDragStart = {
+                                        draggingItemIndex = index
+                                        dragOffset = 0f
+                                    },
+                                    onDrag = { change, dragAmount ->
+                                        change.consume()
+                                        dragOffset += dragAmount.y
+                                        val threshold = 50f
+                                        if (dragOffset > threshold && index < songs.lastIndex) {
+                                            onReorder(index, index + 1)
+                                            draggingItemIndex = index + 1
+                                            dragOffset -= 72.dp.toPx()
+                                        } else if (dragOffset < -threshold && index > 0) {
+                                            onReorder(index, index - 1)
+                                            draggingItemIndex = index - 1
+                                            dragOffset += 72.dp.toPx()
+                                        }
+                                    },
+                                    onDragEnd = {
+                                        draggingItemIndex = null
+                                        dragOffset = 0f
+                                    },
+                                    onDragCancel = {
+                                        draggingItemIndex = null
+                                        dragOffset = 0f
+                                    }
+                                )
+                            }
+                    )
+                }
+            )
+        }
     }
 }
 
@@ -1552,18 +1789,6 @@ fun SettingsMenu(
 ) {
     val dockContentPadding = LocalDockContentPadding.current
     val context = LocalContext.current
-    val preferences = remember {
-        context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
-    }
-    var animationEffectsEnabled by remember {
-        mutableStateOf(preferences.getBoolean("app_animations_enabled", true))
-    }
-    var appLanguage by remember { mutableStateOf(AppLanguageSettings.load(context)) }
-    fun setAnimationEffectsEnabled(enabled: Boolean) {
-        animationEffectsEnabled = enabled
-        AppAnimationSettings.enabled = enabled
-        preferences.edit { putBoolean("app_animations_enabled", enabled) }
-    }
 
     Scaffold(
         topBar = { TopAppBar(title = { Text(appText("设置", "Settings")) }) },
@@ -1577,126 +1802,10 @@ fun SettingsMenu(
                 .navigationBarsPadding()
                 .padding(bottom = 24.dp + dockContentPadding)
         ) {
-            SettingsSectionHeader(appText("界面", "Appearance"))
-            ListItem(
-                headlineContent = { Text(appText("语言", "Language")) },
-                supportingContent = { Text(appText("切换后自动重新载入界面", "The interface reloads after changing language")) },
-                leadingContent = { Icon(Icons.Default.Language, null) }
-            )
-            SingleChoiceSegmentedButtonRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp)
-            ) {
-                AppLanguage.entries.forEachIndexed { index, language ->
-                    SegmentedButton(
-                        selected = appLanguage == language,
-                        onClick = {
-                            if (appLanguage != language) {
-                                appLanguage = language
-                                AppLanguageSettings.save(context, language)
-                                (context as? android.app.Activity)?.recreate()
-                            }
-                        },
-                        shape = SegmentedButtonDefaults.itemShape(index, AppLanguage.entries.size)
-                    ) {
-                        Text(
-                            when (language) {
-                                AppLanguage.SYSTEM -> appText("系统", "System")
-                                AppLanguage.SIMPLIFIED_CHINESE -> "简体中文"
-                                AppLanguage.ENGLISH -> "English"
-                            }
-                        )
-                    }
-                }
+            SettingsSectionHeader(appText("个性化", "Personalization"))
+            SettingsItem(appText("个性化设置", "Personalization settings"), Icons.Default.Palette) {
+                onNavigate(Screen.Personalization)
             }
-            ListItem(
-                headlineContent = { Text(appText("Dock 位置", "Dock position")) },
-                supportingContent = {
-                    Text(
-                        when (dockPosition) {
-                            "top" -> appText("顶部 Dock", "Top dock")
-                            "float" -> appText("所有页面悬浮显示，底部内容透过毛玻璃可见", "Floats on every screen with page content visible through the glass")
-                            else -> appText("底部 Dock", "Bottom dock")
-                        }
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.Dock, null) }
-            )
-            SingleChoiceSegmentedButtonRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp)
-            ) {
-                SegmentedButton(
-                    selected = dockPosition == "top",
-                    onClick = { onDockPositionChange("top") },
-                    shape = SegmentedButtonDefaults.itemShape(0, 3)
-                ) { Text(appText("顶部", "Top")) }
-                SegmentedButton(
-                    selected = dockPosition == "bottom",
-                    onClick = { onDockPositionChange("bottom") },
-                    shape = SegmentedButtonDefaults.itemShape(1, 3)
-                ) { Text(appText("底部", "Bottom")) }
-                SegmentedButton(
-                    selected = dockPosition == "float",
-                    onClick = { onDockPositionChange("float") },
-                    shape = SegmentedButtonDefaults.itemShape(2, 3)
-                ) { Text(appText("悬浮", "Floating")) }
-            }
-            HorizontalDivider()
-            ListItem(
-                headlineContent = { Text(appText("播放页方向", "Player orientation")) },
-                supportingContent = { Text(if (playerLandscape) appText("固定横屏", "Landscape") else appText("固定竖屏", "Portrait")) },
-                leadingContent = { Icon(Icons.Default.ScreenRotation, null) }
-            )
-            SingleChoiceSegmentedButtonRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp)
-            ) {
-                SegmentedButton(
-                    selected = !playerLandscape,
-                    onClick = { onPlayerLandscapeChange(false) },
-                    shape = SegmentedButtonDefaults.itemShape(0, 2),
-                    modifier = Modifier.weight(1f)
-                ) { Text(appText("竖屏", "Portrait")) }
-                SegmentedButton(
-                    selected = playerLandscape,
-                    onClick = { onPlayerLandscapeChange(true) },
-                    shape = SegmentedButtonDefaults.itemShape(1, 2),
-                    modifier = Modifier.weight(1f)
-                ) { Text(appText("横屏", "Landscape")) }
-            }
-            ListItem(
-                headlineContent = { Text("AMOLED") },
-                supportingContent = { Text(appText("深色模式下使用纯黑背景", "Use a pure black background in dark mode")) },
-                leadingContent = { Icon(Icons.Default.Brightness2, null) },
-                trailingContent = { Switch(isAmoledMode, onAmoledModeChange) },
-                modifier = Modifier.clickable { onAmoledModeChange(!isAmoledMode) }
-            )
-            ListItem(
-                headlineContent = { Text(appText("动画效果", "Animations")) },
-                supportingContent = {
-                    Text(
-                        if (animationEffectsEnabled) {
-                            appText("启用页面切换、专辑封面和频谱动画", "Enable screen, artwork, and spectrum animations")
-                        } else {
-                            appText("减少动态效果，页面内容立即切换", "Reduce motion and switch content immediately")
-                        }
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.Speed, null) },
-                trailingContent = {
-                    Switch(
-                        checked = animationEffectsEnabled,
-                        onCheckedChange = { setAnimationEffectsEnabled(it) }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    setAnimationEffectsEnabled(!animationEffectsEnabled)
-                }
-            )
             SettingsSectionHeader(appText("播放与声音", "Playback and audio"))
             SettingsItem(appText("播放设置", "Playback settings"), Icons.Default.GraphicEq) { onNavigate(Screen.Playback) }
             SettingsItem(appText("音频输出与增益", "Audio output and gain"), Icons.Default.Speaker) {
@@ -2047,6 +2156,7 @@ private fun FloatingDockWindow(
             }
         }
     }
+
 }
 
 private fun dockRootScreen(screen: Screen): Screen = when (screen) {
@@ -3061,6 +3171,25 @@ fun rememberArtwork(song: Song, maxPx: Int = 768): Bitmap? {
     return loaded
 }
 
+@Composable
+private fun ConfigurableAlbumArtwork(
+    bitmap: Bitmap,
+    contentDescription: String?,
+    visualizerEnergy: Float = 0f,
+    modifier: Modifier = Modifier
+) {
+    if (AlbumDotMatrixSettings.enabled) {
+        DotMatrixArtwork(bitmap = bitmap, visualizerEnergy = visualizerEnergy, modifier = modifier)
+    } else {
+        androidx.compose.foundation.Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = contentDescription,
+            modifier = modifier,
+            contentScale = ContentScale.Crop
+        )
+    }
+}
+
 /** 音频格式信息：采样率 / 比特率 / 编码 / 容器 */
 data class AudioFormatInfo(
     val sampleRateHz: Int,   // 例如 44100
@@ -3303,12 +3432,13 @@ fun FullPlayerScreen(
     onRepeatModeChange: () -> Unit,
     shuffleMode: Boolean,
     onShuffleModeChange: () -> Unit,
+    onBack: () -> Unit,
     isLandscape: Boolean,
     floatingDockVisible: Boolean,
     fixedDockBottomPadding: androidx.compose.ui.unit.Dp = 0.dp
 ) {
     val configuration = LocalConfiguration.current
-    val artworkSize = if (isLandscape) minOf(220, (configuration.screenHeightDp * 0.34f).toInt()).dp else 300.dp
+    val artworkSize = if (isLandscape) minOf(360, (configuration.screenHeightDp * 0.52f).toInt()).dp else 300.dp
     val pagePadding = if (isLandscape) 16.dp else 32.dp
     val sectionPadding = if (isLandscape) 4.dp else 16.dp
     val floatingDockControlPadding = if (!floatingDockVisible) {
@@ -3355,7 +3485,9 @@ fun FullPlayerScreen(
     }
     val beatEnergy = rememberBeatEnergy(
         isPlaying = isPlaying,
-        enabled = artworkBeatEnabled && animationsEnabled
+        enabled = (artworkBeatEnabled ||
+            (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled)) &&
+            animationsEnabled
     )
     val beatScale by animateFloatAsState(
         targetValue = beatScaleFromEnergy(beatEnergy),
@@ -3421,18 +3553,39 @@ fun FullPlayerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .windowInsetsPadding(WindowInsets.safeDrawing)
-                    .padding(horizontal = 24.dp, vertical = 8.dp)
+                    .padding(horizontal = 28.dp, vertical = 12.dp)
                     .padding(bottom = dockControlPadding)
             ) {
                 Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onBack, modifier = Modifier.padding(end = 8.dp)) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = appText("返回音乐列表", "Back to music library")
+                        )
+                    }
+                    Column(Modifier.weight(1f)) {
+                        AnimatedSongText(song, songs, MaterialTheme.typography.headlineMedium)
+                        AnimatedArtistText(song, songs, MaterialTheme.typography.titleMedium)
+                    }
+                    Icon(
+                        Icons.Default.Sensors,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f),
+                        modifier = Modifier.size(26.dp)
+                    )
+                }
+                Row(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(24.dp)
+                    horizontalArrangement = Arrangement.spacedBy(34.dp)
                 ) {
                     Column(
-                        modifier = Modifier.weight(0.42f).fillMaxHeight(),
+                        modifier = Modifier.weight(0.47f).fillMaxHeight(),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                             AnimatedContent(
                                 targetState = song.uri,
                                 transitionSpec = { songChangeTransition(songs, initialState, targetState) },
@@ -3441,17 +3594,17 @@ fun FullPlayerScreen(
                                 val targetSong = songs.firstOrNull { it.uri == targetUri } ?: song
                                 val targetArtwork = rememberArtwork(targetSong)
                                 if (targetArtwork != null) {
-                                    androidx.compose.foundation.Image(
-                                        targetArtwork.asImageBitmap(),
-                                        null,
-                                        Modifier
+                                    ConfigurableAlbumArtwork(
+                                        bitmap = targetArtwork,
+                                        contentDescription = null,
+                                        visualizerEnergy = beatEnergy,
+                                        modifier = Modifier
                                             .size(artworkSize)
                                             .graphicsLayer {
                                                 scaleX = beatScale
                                                 scaleY = beatScale
                                             }
                                             .clip(RoundedCornerShape(20.dp)),
-                                        contentScale = ContentScale.Crop
                                     )
                                 } else {
                                     Surface(
@@ -3471,53 +3624,51 @@ fun FullPlayerScreen(
                                 }
                             }
                         }
-                        AnimatedSongText(song, songs, MaterialTheme.typography.titleMedium)
-                        AnimatedArtistText(song, songs, MaterialTheme.typography.bodyMedium)
+                        AudioFormatBadges(
+                            audioFormat = audioFormat.value,
+                            fileSize = song.duration,
+                            centered = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        SpectrumProgressSlider(
+                            value = sliderPosition,
+                            onValueChange = { isDragging = true; sliderPosition = it },
+                            onValueChangeFinished = {
+                                onSeek((sliderPosition * duration).toLong())
+                                isDragging = false
+                            },
+                            isPlaying = isPlaying,
+                            spectrumEnabled = spectrumProgressEnabled,
+                            colors = SliderDefaults.colors(
+                                thumbColor = MaterialTheme.colorScheme.onSurface,
+                                activeTrackColor = MaterialTheme.colorScheme.onSurface
+                            )
+                        )
+                        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                            val shownPosition = if (isDragging) (sliderPosition * duration).toLong() else position
+                            Text(formatTime(shownPosition), style = MaterialTheme.typography.bodySmall)
+                            Text(formatTime(duration), style = MaterialTheme.typography.bodySmall)
+                        }
+                        ControllerRow(
+                            onPrevious = onPrevious,
+                            onTogglePlay = onTogglePlay,
+                            onNext = onNext,
+                            isPlaying = isPlaying,
+                            compact = true,
+                            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                            repeatMode = repeatMode,
+                            onRepeatModeChange = onRepeatModeChange,
+                            shuffleMode = shuffleMode,
+                            onShuffleModeChange = onShuffleModeChange
+                        )
                     }
 
                     Box(
-                        modifier = Modifier.weight(0.58f).fillMaxHeight().padding(top = 8.dp),
+                        modifier = Modifier.weight(0.53f).fillMaxHeight(),
                         contentAlignment = Alignment.Center
                     ) {
                         LyricView(lyrics, position, duration, onSeek)
                     }
-                }
-
-                Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                    SpectrumProgressSlider(
-                        value = sliderPosition,
-                        onValueChange = {
-                            isDragging = true
-                            sliderPosition = it
-                        },
-                        onValueChangeFinished = {
-                            onSeek((sliderPosition * duration).toLong())
-                            isDragging = false
-                        },
-                        isPlaying = isPlaying,
-                        spectrumEnabled = spectrumProgressEnabled,
-                        colors = SliderDefaults.colors(
-                            thumbColor = MaterialTheme.colorScheme.primary,
-                            activeTrackColor = MaterialTheme.colorScheme.primary
-                        )
-                    )
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        val shownPosition = if (isDragging) (sliderPosition * duration).toLong() else position
-                        Text(formatTime(shownPosition), style = MaterialTheme.typography.bodySmall)
-                        Text(formatTime(duration), style = MaterialTheme.typography.bodySmall)
-                    }
-                    ControllerRow(
-                        onPrevious = onPrevious,
-                        onTogglePlay = onTogglePlay,
-                        onNext = onNext,
-                        isPlaying = isPlaying,
-                        compact = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        repeatMode = repeatMode,
-                        onRepeatModeChange = onRepeatModeChange,
-                        shuffleMode = shuffleMode,
-                        onShuffleModeChange = onShuffleModeChange
-                    )
                 }
             }
         } else {
@@ -3563,13 +3714,15 @@ fun FullPlayerScreen(
                                 speed = scratchSpeed,
                                 isScratching = isDragging,
                                 beatScale = beatScale,
+                                visualizerEnergy = beatEnergy,
                                 onClick = { showLyrics = true }
                             )
                         } else if (targetArtwork != null) {
-                            androidx.compose.foundation.Image(
-                                targetArtwork.asImageBitmap(),
-                                null,
-                                Modifier
+                            ConfigurableAlbumArtwork(
+                                bitmap = targetArtwork,
+                                contentDescription = null,
+                                visualizerEnergy = beatEnergy,
+                                modifier = Modifier
                                     .size(artworkSize)
                                     .graphicsLayer {
                                         scaleX = beatScale
@@ -3577,7 +3730,6 @@ fun FullPlayerScreen(
                                     }
                                     .clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp))
                                     .clickable { showLyrics = true },
-                                contentScale = ContentScale.Crop
                             )
                         } else {
                             Surface(
@@ -3768,6 +3920,7 @@ fun DjTurntable(
     speed: Float,
     isScratching: Boolean,
     beatScale: Float = 1f,
+    visualizerEnergy: Float = 0f,
     onClick: () -> Unit
 ) {
     Box(
@@ -3799,11 +3952,11 @@ fun DjTurntable(
             contentAlignment = Alignment.Center
         ) {
             if (artwork != null) {
-                androidx.compose.foundation.Image(
-                    bitmap = artwork.asImageBitmap(),
+                ConfigurableAlbumArtwork(
+                    bitmap = artwork,
                     contentDescription = null,
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
+                    visualizerEnergy = visualizerEnergy,
+                    modifier = Modifier.fillMaxSize()
                 )
             } else {
                 Icon(
@@ -3928,6 +4081,23 @@ fun ControllerRow(
     }
 }
 
+private data class BilingualLyricLine(
+    val timestamp: Long,
+    val original: String,
+    val translation: String?
+)
+
+private fun groupBilingualLyrics(lyrics: List<Pair<Long, String>>): List<BilingualLyricLine> =
+    lyrics.groupBy { it.first }
+        .toSortedMap()
+        .map { (timestamp, entries) ->
+            BilingualLyricLine(
+                timestamp = timestamp,
+                original = entries.first().second,
+                translation = entries.drop(1).joinToString(" / ") { it.second }.takeIf { it.isNotBlank() }
+            )
+        }
+
 @Composable
 fun LyricView(
     lyrics: List<Pair<Long, String>>,
@@ -3946,13 +4116,32 @@ fun LyricView(
         Box(Modifier.fillMaxSize(), Alignment.Center) { Text(appText("未找到歌词", "No lyrics found"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
         return
     }
-    val lineIdx = lyrics.indexOfLast { it.first <= currentPosition }
+    val displayLyrics = remember(lyrics) { groupBilingualLyrics(lyrics) }
+    val lineIdx = displayLyrics.indexOfLast { it.timestamp <= currentPosition }
     val listState = rememberLazyListState()
-    LaunchedEffect(lineIdx) {
-        if (lineIdx >= 0) listState.animateScrollToItem(
-            index = lineIdx.coerceAtMost(lyrics.lastIndex),
-            scrollOffset = -240
-        )
+    LaunchedEffect(
+        lineIdx,
+        configuration.orientation,
+        configuration.screenHeightDp,
+        lyricFontScale,
+        displayLyrics.size
+    ) {
+        if (lineIdx >= 0) {
+            val currentIndex = lineIdx.coerceAtMost(displayLyrics.lastIndex)
+            withFrameNanos { }
+            if (listState.layoutInfo.visibleItemsInfo.none { it.index == currentIndex }) {
+                listState.scrollToItem(currentIndex)
+            }
+            val layoutInfo = snapshotFlow { listState.layoutInfo }.first { info ->
+                info.viewportEndOffset > info.viewportStartOffset &&
+                    info.visibleItemsInfo.any { it.index == currentIndex }
+            }
+            val currentItem = layoutInfo.visibleItemsInfo.first { it.index == currentIndex }
+            val viewportCenter =
+                (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2f
+            val currentItemCenter = currentItem.offset + currentItem.size / 2f
+            listState.animateScrollBy(currentItemCenter - viewportCenter)
+        }
     }
     LazyColumn(
         state = listState,
@@ -3969,14 +4158,15 @@ fun LyricView(
         contentPadding = PaddingValues(vertical = 220.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        itemsIndexed(lyrics) { index, entry ->
-            val (timestamp, text) = entry
+        itemsIndexed(displayLyrics) { index, entry ->
+            val timestamp = entry.timestamp
+            val text = entry.original
             val isCurrent = index == lineIdx
             val distanceFromCurrent = kotlin.math.abs(index - lineIdx)
             val nextTimestamp = if (isCurrent) {
-                lyrics.asSequence()
+                displayLyrics.asSequence()
                     .drop(index + 1)
-                    .map { it.first }
+                    .map { it.timestamp }
                     .firstOrNull { it > timestamp }
             } else {
                 null
@@ -4015,7 +4205,7 @@ fun LyricView(
                 animationSpec = tween(520),
                 label = "lyricBlur"
             )
-            Box(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(
@@ -4027,7 +4217,6 @@ fun LyricView(
                     .graphicsLayer {
                         alpha = textAlpha
                     },
-                contentAlignment = Alignment.CenterStart
             ) {
                 val textStyle = if (isCurrent) {
                     MaterialTheme.typography.headlineMedium.copy(
@@ -4069,6 +4258,20 @@ fun LyricView(
                     )
                 } else {
                     Text(text = text, style = textStyle)
+                }
+                entry.translation?.let { translation ->
+                    Text(
+                        text = translation,
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontSize = (16f * lyricFontScale).sp,
+                            lineHeight = (22f * lyricFontScale).sp,
+                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium
+                        ),
+                        color = MaterialTheme.colorScheme.onSurface.copy(
+                            alpha = if (isCurrent) 0.72f else 0.48f
+                        ),
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
                 }
             }
         }

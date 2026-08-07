@@ -2,6 +2,7 @@ package com.example.music
 
 sealed class Screen {
     data object Settings : Screen()
+    data object Personalization : Screen()
     data object Library : Screen()
     data object WebDav : Screen()
     data object Data : Screen()
@@ -20,7 +21,7 @@ sealed class Screen {
         PlayerView -> LocalMusic
         Equalizer -> LocalMusic
         Settings -> LocalMusic
-        Library, WebDav, Data, Playback, AudioOutput, LyricsAndDevices, LyricsSettings, AudioCodecs,
+        Library, WebDav, Data, Playback, AudioOutput, Personalization, LyricsAndDevices, LyricsSettings, AudioCodecs,
         AboutSupport -> Settings
     }
 }

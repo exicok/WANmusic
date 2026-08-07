@@ -91,11 +91,19 @@ object LyricsStateHolder {
     fun resolveLineProgress(position: Long = effectivePosition()): LineProgress? {
         if (lyrics.isEmpty()) return null
         val sorted = lyrics
-        val idx = sorted.indexOfLast { it.first <= position }
-        if (idx < 0) return null
-        val (begin, text) = sorted[idx]
+        val matchedIndex = sorted.indexOfLast { it.first <= position }
+        if (matchedIndex < 0) return null
+        val begin = sorted[matchedIndex].first
+        val idx = sorted.indexOfFirst { it.first == begin }
+        val sameTimestampLines = sorted
+            .asSequence()
+            .drop(idx)
+            .takeWhile { it.first == begin }
+            .map { it.second }
+            .toList()
+        val text = sameTimestampLines.joinToString("\n")
         val next = sorted.asSequence()
-            .drop(idx + 1)
+            .drop(idx + sameTimestampLines.size)
             .map { it.first }
             .firstOrNull { it > begin }
         val end = next
