@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
@@ -35,14 +37,11 @@ class OverlayLyricsService : Service() {
 
     companion object {
         private const val ACTION_STOP = "com.example.music.OVERLAY_STOP"
+        private const val ACTION_REFRESH_STYLE = "com.example.music.OVERLAY_REFRESH_STYLE"
         private const val PREFS = "music_prefs"
         private const val KEY_ENABLED = "overlay_lyrics_enabled"
         private const val KEY_POS_X = "overlay_lyrics_x"
         private const val KEY_POS_Y = "overlay_lyrics_y"
-
-        private val COLOR_PLAYED = Color.WHITE
-        private val COLOR_PENDING = Color.argb(0x59, 0xFF, 0xFF, 0xFF) // ~35% white
-        private val COLOR_TITLE = Color.argb(0xB0, 0xFF, 0xFF, 0xFF)
 
         fun start(context: Context) {
             val intent = Intent(context, OverlayLyricsService::class.java)
@@ -80,6 +79,14 @@ class OverlayLyricsService : Service() {
                 start(context)
             }
         }
+
+        fun refreshStyle(context: Context) {
+            if (isRunning()) {
+                context.startService(
+                    Intent(context, OverlayLyricsService::class.java).setAction(ACTION_REFRESH_STYLE)
+                )
+            }
+        }
     }
 
     private var windowManager: WindowManager? = null
@@ -89,6 +96,40 @@ class OverlayLyricsService : Service() {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var lastSignature: String = ""
     private var mediaController: MediaController? = null
+    private var currentStyle: OverlayLyricsStyle? = null
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun applyOverlayStyle() {
+        val root = overlayView?.findViewById<View>(R.id.overlay_root) ?: return
+        val titleView = overlayView?.findViewById<TextView>(R.id.overlay_song_title) ?: return
+        val lyricView = overlayView?.findViewById<TextView>(R.id.overlay_lyric_text) ?: return
+        val style = OverlayLyricsStyle.load(this)
+        currentStyle = style
+
+        root.background = if (style.backgroundEnabled) {
+            GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(style.backgroundColor)
+            }
+        } else {
+            null
+        }
+        root.setPadding(dp(if (style.backgroundEnabled) 16 else 8), dp(10), dp(if (style.backgroundEnabled) 16 else 8), dp(10))
+        lyricView.setTextColor(style.textColor)
+        lyricView.textSize = style.textSizeSp
+        lyricView.typeface = when (style.fontFamily) {
+            "serif" -> Typeface.create(Typeface.SERIF, Typeface.BOLD)
+            "mono" -> Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            else -> Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        }
+        titleView.setTextColor(Color.argb(0xB8, Color.red(style.textColor), Color.green(style.textColor), Color.blue(style.textColor)))
+        titleView.textSize = (style.textSizeSp * 0.62f).coerceAtLeast(9f)
+        titleView.typeface = lyricView.typeface
+        lastSignature = ""
+        overlayView?.requestLayout()
+    }
 
     private fun clampOverlayPosition() {
         val wm = windowManager ?: return
@@ -121,6 +162,7 @@ class OverlayLyricsService : Service() {
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         overlayView = LayoutInflater.from(this).inflate(R.layout.overlay_lyrics, null)
+        applyOverlayStyle()
 
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val params = WindowManager.LayoutParams(
@@ -255,11 +297,10 @@ class OverlayLyricsService : Service() {
         if (signature == lastSignature) return
         lastSignature = signature
 
-        songTitleView?.setTextColor(COLOR_TITLE)
         songTitleView?.text = titleText
 
         if (progress == null || progress.line.isEmpty()) {
-            lyricTextView?.setTextColor(COLOR_PLAYED)
+            lyricTextView?.setTextColor(currentStyle?.textColor ?: Color.WHITE)
             lyricTextView?.text = if (title.isEmpty()) {
                 getString(R.string.overlay_idle_lyric)
             } else {
@@ -269,8 +310,10 @@ class OverlayLyricsService : Service() {
         }
 
         lyricTextView?.text = LyricsStateHolder.buildKaraokeSpannable(
-            playedColor = COLOR_PLAYED,
-            pendingColor = COLOR_PENDING,
+            playedColor = currentStyle?.textColor ?: Color.WHITE,
+            pendingColor = (currentStyle?.textColor ?: Color.WHITE).let { color ->
+                Color.argb(0x59, Color.red(color), Color.green(color), Color.blue(color))
+            },
             position = position
         )
     }
@@ -280,6 +323,11 @@ class OverlayLyricsService : Service() {
             setEnabled(this, false)
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_REFRESH_STYLE) {
+            applyOverlayStyle()
+            updateOverlay()
+            return START_STICKY
         }
         if (!Settings.canDrawOverlays(this)) {
             setEnabled(this, false)

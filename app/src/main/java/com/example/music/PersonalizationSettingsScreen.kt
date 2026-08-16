@@ -12,7 +12,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Brightness2
-import androidx.compose.material.icons.filled.Dock
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.LibraryMusic
@@ -66,8 +65,6 @@ object MusicLibraryStyleSettings {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PersonalizationSettingsScreen(
-    dockPosition: String,
-    onDockPositionChange: (String) -> Unit,
     playerLandscape: Boolean,
     onPlayerLandscapeChange: (Boolean) -> Unit,
     isAmoledMode: Boolean,
@@ -132,28 +129,6 @@ fun PersonalizationSettingsScreen(
                             AppLanguage.SYSTEM -> appText("系统", "System")
                             AppLanguage.SIMPLIFIED_CHINESE -> "简体中文"
                             AppLanguage.ENGLISH -> "English"
-                        })
-                    }
-                }
-            }
-
-            SettingsSectionHeader(appText("Dock", "Dock"))
-            ListItem(
-                headlineContent = { Text(appText("Dock 位置", "Dock position")) },
-                supportingContent = { Text(appText("选择顶部、底部或悬浮显示", "Choose top, bottom, or floating placement")) },
-                leadingContent = { Icon(Icons.Default.Dock, null) }
-            )
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-                listOf("top", "bottom", "float").forEachIndexed { index, position ->
-                    SegmentedButton(
-                        selected = dockPosition == position,
-                        onClick = { onDockPositionChange(position) },
-                        shape = SegmentedButtonDefaults.itemShape(index, 3)
-                    ) {
-                        Text(when (position) {
-                            "top" -> appText("顶部", "Top")
-                            "float" -> appText("悬浮", "Floating")
-                            else -> appText("底部", "Bottom")
                         })
                     }
                 }
@@ -296,6 +271,18 @@ fun PersonalizationSettingsScreen(
                 onValueChange = { AlbumDotMatrixSettings.setDepth(context, it) },
                 valueRange = 0f..1f,
                 enabled = AlbumDotMatrixSettings.enabled,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
+            )
+            ListItem(
+                headlineContent = { Text(appText("跳动区间", "Jump range")) },
+                supportingContent = { Text(String.format("%.2fx", AlbumDotMatrixSettings.jumpStrength)) }
+            )
+            Slider(
+                value = AlbumDotMatrixSettings.jumpStrength,
+                onValueChange = { AlbumDotMatrixSettings.setJumpStrength(context, it) },
+                valueRange = 0f..2f,
+                steps = 19,
+                enabled = AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
             )
             ListItem(

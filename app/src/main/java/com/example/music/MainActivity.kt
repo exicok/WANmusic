@@ -618,18 +618,21 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             window.isNavigationBarContrastEnforced = false
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
+            window.attributes = window.attributes.apply { blurBehindRadius = 8 }
+            window.setBackgroundBlurRadius(8)
+        }
         setContent {
             remember(this) {
                 AlbumDotMatrixSettings.load(this)
                 MusicLibraryStyleSettings.load(this)
                 true
             }
-            var dockPosition by remember { mutableStateOf(prefs.getString("dock_position", "bottom") ?: "bottom") }
             var isAmoledMode by remember { mutableStateOf(savedAmoledMode) }
             var isDjMode by remember { mutableStateOf(savedDjMode) }
             var playerLandscape by remember { mutableStateOf(savedPlayerLandscape) }
 
-            LaunchedEffect(dockPosition) { prefs.edit { putString("dock_position", dockPosition) } }
             LaunchedEffect(isAmoledMode) { prefs.edit { putBoolean("is_amoled_mode", isAmoledMode) } }
             LaunchedEffect(isDjMode) { prefs.edit { putBoolean("is_dj_mode", isDjMode) } }
             LaunchedEffect(playerLandscape) { prefs.edit { putBoolean("player_landscape", playerLandscape) } }
@@ -648,8 +651,6 @@ class MainActivity : ComponentActivity() {
                             initialDirs = savedDirs,
                             initialSongs = savedSongs,
                             onDirsChanged = { dirs -> ConfigManager.saveDirectories(this, dirs) },
-                            dockPosition = dockPosition,
-                            onDockPositionChange = { dockPosition = it },
                             isAmoledMode = isAmoledMode,
                             onAmoledModeChange = { isAmoledMode = it },
                             isDjMode = isDjMode,
@@ -719,8 +720,6 @@ fun MusicApp(
     initialDirs: List<Uri>,
     initialSongs: List<Song>,
     onDirsChanged: (List<Uri>) -> Unit,
-    dockPosition: String,
-    onDockPositionChange: (String) -> Unit,
     isAmoledMode: Boolean,
     onAmoledModeChange: (Boolean) -> Unit,
     isDjMode: Boolean,
@@ -1040,13 +1039,6 @@ fun MusicApp(
     val floatingDockArtwork = currentSong?.let { rememberArtwork(it) }
     var floatingDockDragProgress by remember { mutableFloatStateOf(0f) }
     var floatingDockDragging by remember { mutableStateOf(false) }
-    LaunchedEffect(dockPosition) {
-        if (!dockPosition.equals("float", ignoreCase = true)) {
-            floatingDockDragProgress = 0f
-            floatingDockDragging = false
-        }
-    }
-
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1058,64 +1050,18 @@ fun MusicApp(
                 alpha = 1f - progress * 0.12f
             }
     ) {
-        val isFloatDock = dockPosition.equals("float", ignoreCase = true)
-        val dockScreens = setOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
         val hideDockForLandscapePlayer = currentScreen == Screen.PlayerView && playerLandscape
-        val showDock = (currentScreen in dockScreens || isFloatDock) && !hideDockForLandscapePlayer
-        val floatOverlayActive = isFloatDock && !hideDockForLandscapePlayer
+        val floatOverlayActive = !hideDockForLandscapePlayer
         val floatDockHasMiniPlayer = currentSong != null && currentScreen != Screen.PlayerView
         // 覆盖迷你播放器/导航栏、手势导航区及外边距，确保任何页面内容都位于 Dock 上方。
-        val floatingDockSpace = if (floatDockHasMiniPlayer) 184.dp else 108.dp
-        val showFixedBottomBar = showDock && dockPosition == "bottom"
+        val floatingDockSpace = 98.dp
         Scaffold(
             containerColor = if (currentScreen == Screen.PlayerView) Color.Transparent
                 else MaterialTheme.colorScheme.background,
             // 所有页面背景完整绘制到状态栏和导航栏后方；交互内容由各页面自行避让系统栏。
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
-            topBar = {
-                if (showDock && dockPosition == "top") {
-                    Column(
-                        Modifier
-                            .statusBarsPadding()
-                            .padding(top = 8.dp)
-                    ) {
-                        MusicDock(currentScreen = currentScreen, onNavigate = { currentScreen = it })
-                        if (currentSong != null && currentScreen != Screen.PlayerView) MD3MiniPlayer(
-                            song = currentSong!!,
-                            isPlaying = isPlaying,
-                            progress = if (totalDuration > 0) currentPosition.toFloat() / totalDuration else 0f,
-                            onTogglePlay = { if (player.isPlaying) player.pause() else player.play() },
-                            onClick = openPlayer,
-                            onNext = { player.seekToNext() },
-                            onPrevious = { player.seekToPrevious() },
-                            onSeek = { player.seekTo((it * totalDuration).toLong()) }
-                        )
-                    }
-                }
-            },
-            bottomBar = {
-                // 仅固定底部模式使用 Scaffold 底栏；悬浮模式始终作为透明覆盖层绘制。
-                if (showFixedBottomBar) {
-                    Column {
-                        if (currentSong != null && currentScreen != Screen.PlayerView) {
-                        MD3MiniPlayer(
-                            song = currentSong!!,
-                            isPlaying = isPlaying,
-                            progress = if (totalDuration > 0) currentPosition.toFloat() / totalDuration else 0f,
-                            onTogglePlay = { if (player.isPlaying) player.pause() else player.play() },
-                            onClick = openPlayer,
-                            onNext = { player.seekToNext() },
-                            onPrevious = { player.seekToPrevious() },
-                            onSeek = { player.seekTo((it * totalDuration).toLong()) }
-                        )
-                        }
-                        MusicDock(
-                            currentScreen = currentScreen,
-                            onNavigate = { currentScreen = it }
-                        )
-                    }
-                }
-            }
+            topBar = {},
+            bottomBar = {}
         ) { innerPadding ->
             Box(
                 modifier = Modifier
@@ -1198,16 +1144,7 @@ fun MusicApp(
                                     onBack = handleBack,
                                     isLandscape = playerLandscape,
                                     floatingDockVisible = floatOverlayActive,
-                                    fixedDockBottomPadding = if (showFixedBottomBar) {
-                                        (
-                                            innerPadding.calculateBottomPadding() -
-                                                WindowInsets.navigationBars
-                                                    .asPaddingValues()
-                                                    .calculateBottomPadding()
-                                        ).coerceAtLeast(0.dp)
-                                    } else {
-                                        0.dp
-                                    }
+                                    fixedDockBottomPadding = 0.dp
                                 )
                             } else {
                                 Box(
@@ -1235,7 +1172,7 @@ fun MusicApp(
                             isScanning = isScanning,
                             backgroundArtwork = floatingDockArtwork,
                             bottomContentPadding = if (floatOverlayActive) floatingDockSpace else 0.dp,
-                            protectStatusBarContent = dockPosition != "top",
+                            protectStatusBarContent = true,
                             onSongClick = { song ->
                                 startSongPlayback(song)
                                 val openOnClick = context
@@ -1259,8 +1196,6 @@ fun MusicApp(
                             }
                         )
                         Screen.Settings -> SettingsMenu(
-                            dockPosition = dockPosition,
-                            onDockPositionChange = onDockPositionChange,
                             playerLandscape = playerLandscape,
                             onPlayerLandscapeChange = onPlayerLandscapeChange,
                             isAmoledMode = isAmoledMode,
@@ -1268,8 +1203,6 @@ fun MusicApp(
                             onNavigate = { currentScreen = it }
                         )
                         Screen.Personalization -> PersonalizationSettingsScreen(
-                            dockPosition = dockPosition,
-                            onDockPositionChange = onDockPositionChange,
                             playerLandscape = playerLandscape,
                             onPlayerLandscapeChange = onPlayerLandscapeChange,
                             isAmoledMode = isAmoledMode,
@@ -1342,7 +1275,8 @@ fun MusicApp(
                             onClick = openPlayer,
                             onNext = { player.seekToNext() },
                             onPrevious = { player.seekToPrevious() },
-                            onSeek = { player.seekTo((it * totalDuration).toLong()) }
+                            onSeek = { player.seekTo((it * totalDuration).toLong()) },
+                            compactFloating = true
                         )
                     }
                 } else {
@@ -1353,7 +1287,7 @@ fun MusicApp(
                     currentScreen = currentScreen,
                     onNavigate = { currentScreen = it },
                     floating = true,
-                    onLiquidDragChange = { progress, dragging ->
+                    onExpressiveDragChange = { progress, dragging ->
                         floatingDockDragProgress = progress
                         floatingDockDragging = dragging
                     }
@@ -1430,6 +1364,8 @@ fun LocalMusicScreen(
             }?.index
         }
             .distinctUntilChanged()
+            // 滚动过程中限制中央卡片状态提交频率，避免每一帧重组所有卡片。
+            .debounce(32)
             .collectLatest { centeredIndex ->
                 if (centeredIndex != null && centeredIndex in songs.indices) {
                     centeredSongIndex = centeredIndex
@@ -1779,8 +1715,6 @@ private fun TraditionalMusicList(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsMenu(
-    dockPosition: String,
-    onDockPositionChange: (String) -> Unit,
     playerLandscape: Boolean,
     onPlayerLandscapeChange: (Boolean) -> Unit,
     isAmoledMode: Boolean,
@@ -2015,7 +1949,7 @@ private fun FloatingDockWindow(
     dock: @Composable () -> Unit
 ) {
     val animationsEnabled = AppAnimationSettings.enabled
-    val liquidProgress by animateFloatAsState(
+    val expressiveProgress by animateFloatAsState(
         targetValue = dragProgress.coerceIn(-1f, 1f),
         animationSpec = if (isDragging || !animationsEnabled) {
             snap()
@@ -2025,133 +1959,57 @@ private fun FloatingDockWindow(
                 stiffness = Spring.StiffnessMediumLow
             )
         },
-        label = "FloatingDockLiquidDrag"
+        label = "Md3ExpressiveDockDrag"
     )
-    val dragEnergy = kotlin.math.abs(liquidProgress)
-    val shape = RoundedCornerShape((26f + dragEnergy * 8f).dp)
+    val dragEnergy = kotlin.math.abs(expressiveProgress)
+    val dockShape = RoundedCornerShape((32f + dragEnergy * 8f).dp)
     val navigationBarHeight = WindowInsets.navigationBars
         .asPaddingValues()
         .calculateBottomPadding()
-    val glassTint = MaterialTheme.colorScheme.surface.copy(alpha = 0.18f)
-    val glassBorder = Color.White.copy(alpha = 0.52f + dragEnergy * 0.16f)
-    val innerBorder = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
-    val glassMotion = rememberInfiniteTransition(label = "DockDynamicBackdrop")
-    val backdropPhase by glassMotion.animateFloat(
-        initialValue = -1f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(4_600),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "DockBackdropPhase"
-    )
 
-    Box(modifier = modifier) {
-        // 延伸玻璃环境色到手势导航区域，避免 Dock 与系统栏之间出现色彩断层。
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .height(navigationBarHeight + 10.dp)
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            MaterialTheme.colorScheme.surface.copy(alpha = 0.04f),
-                            MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.24f)
-                        )
-                    )
-                )
-        )
-
-        Surface(
+    Box(
+        modifier = modifier.height(navigationBarHeight + 90.dp)
+    ) {
+        Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(start = 12.dp, end = 12.dp, bottom = 10.dp)
-                .graphicsLayer {
-                    val directionAnchor = if (liquidProgress >= 0f) 0f else 1f
-                    transformOrigin = TransformOrigin(directionAnchor, 0.5f)
-                    translationX = liquidProgress * size.width * 0.025f
-                    scaleX = 1f + dragEnergy * 0.055f
-                    scaleY = 1f - dragEnergy * 0.025f
-                    rotationZ = liquidProgress * 0.8f
-                },
-            shape = shape,
-            color = Color.Transparent,
-            tonalElevation = 0.dp,
-            shadowElevation = 22.dp,
-            border = BorderStroke(
-                1.dp,
-                glassBorder
-            )
+                .padding(horizontal = 12.dp, vertical = 12.dp)
+                .height(62.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
+            Surface(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(shape)
-                    .background(glassTint)
-                    .border(1.dp, innerBorder, shape)
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .graphicsLayer {
+                        val directionAnchor = if (expressiveProgress >= 0f) 0f else 1f
+                        transformOrigin = TransformOrigin(directionAnchor, 0.5f)
+                        translationX = expressiveProgress * size.width * 0.012f
+                        scaleX = 1f + dragEnergy * 0.025f
+                        scaleY = 1f - dragEnergy * 0.014f
+                    },
+                shape = dockShape,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.58f),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 6.dp,
+                shadowElevation = 12.dp,
+                border = BorderStroke(
+                    1.dp,
+                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)
+                )
             ) {
-                // 不绘制专辑图：透明玻璃层直接显示 Dock 下方的真实页面内容。
-                // 中性玻璃膜只负责压低对比度，保证图标和文字清晰。
+                dock()
+            }
+            if (miniPlayer != null) {
                 Box(
-                    Modifier
-                        .matchParentSize()
-                        .graphicsLayer {
-                            translationX = backdropPhase * size.width * 0.012f
-                            alpha = 0.88f + dragEnergy * 0.08f
-                        }
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(
-                                    Color.White.copy(alpha = 0.18f),
-                                    MaterialTheme.colorScheme.surface.copy(alpha = 0.10f),
-                                    MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.22f)
-                                )
-                            )
-                        )
-                )
-
-                // 顶部镜面反射是液态玻璃边缘厚度的主要视觉线索。
-                Box(
-                    Modifier
-                        .align(Alignment.TopCenter)
-                        .fillMaxWidth(0.90f)
-                        .height(1.5.dp)
-                        .background(
-                            Brush.horizontalGradient(
-                                listOf(
-                                    Color.Transparent,
-                                    Color.White.copy(alpha = 0.82f),
-                                    Color.White.copy(alpha = 0.38f),
-                                    Color.Transparent
-                                )
-                            )
-                        )
-                )
-
-                // 底部轻微色散模拟玻璃厚边，不增加额外控件高度。
-                Box(
-                    Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth(0.82f)
-                        .height(2.dp)
-                        .background(
-                            Brush.horizontalGradient(
-                                listOf(
-                                    Color.Transparent,
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.28f),
-                                    Color.White.copy(alpha = 0.30f),
-                                    MaterialTheme.colorScheme.tertiary.copy(alpha = 0.24f),
-                                    Color.Transparent
-                                )
-                            )
-                        )
-                )
-                Column {
-                    miniPlayer?.invoke()
-                    dock()
+                    modifier = Modifier
+                        .width(100.dp)
+                        .fillMaxHeight()
+                ) {
+                    miniPlayer()
                 }
             }
         }
@@ -2171,7 +2029,7 @@ private fun MusicDock(
     currentScreen: Screen,
     onNavigate: (Screen) -> Unit,
     floating: Boolean = false,
-    onLiquidDragChange: (Float, Boolean) -> Unit = { _, _ -> }
+    onExpressiveDragChange: (Float, Boolean) -> Unit = { _, _ -> }
 ) {
     val dockScreens = remember {
         listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
@@ -2179,25 +2037,25 @@ private fun MusicDock(
     val selectedScreen = dockRootScreen(currentScreen)
     val dragThreshold = with(LocalDensity.current) { 48.dp.toPx() }
     var dragOffset by remember { mutableFloatStateOf(0f) }
-    val floatingItemColors = NavigationBarItemDefaults.colors(
-        selectedIconColor = MaterialTheme.colorScheme.onSurface,
+    val md3ItemColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
         selectedTextColor = MaterialTheme.colorScheme.onSurface,
-        indicatorColor = Color.White.copy(alpha = 0.22f),
+        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
         unselectedIconColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f),
         unselectedTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f)
     )
-    val dockModifier = (if (floating) Modifier.height(68.dp) else Modifier)
+    val dockModifier = Modifier
         .graphicsLayer {
             translationX = if (floating) 0f else dragOffset * 0.16f
         }
         .pointerInput(currentScreen, dragThreshold) {
             detectHorizontalDragGestures(
                 onDragStart = {
-                    if (floating) onLiquidDragChange(0f, true)
+                    if (floating) onExpressiveDragChange(0f, true)
                 },
                 onDragCancel = {
                     dragOffset = 0f
-                    if (floating) onLiquidDragChange(0f, false)
+                    if (floating) onExpressiveDragChange(0f, false)
                 },
                 onDragEnd = {
                     val currentIndex = dockScreens.indexOf(selectedScreen)
@@ -2212,7 +2070,7 @@ private fun MusicDock(
                         }
                     }
                     dragOffset = 0f
-                    if (floating) onLiquidDragChange(0f, false)
+                    if (floating) onExpressiveDragChange(0f, false)
                 }
             ) { change, dragAmount ->
                 change.consume()
@@ -2220,7 +2078,7 @@ private fun MusicDock(
                     .coerceIn(-dragThreshold * 1.5f, dragThreshold * 1.5f)
                 dragOffset = nextOffset
                 if (floating) {
-                    onLiquidDragChange(
+                    onExpressiveDragChange(
                         (nextOffset / (dragThreshold * 1.5f)).coerceIn(-1f, 1f),
                         true
                     )
@@ -2228,10 +2086,78 @@ private fun MusicDock(
             }
         }
 
+    if (floating) {
+        val destinations = listOf(
+            Triple(Screen.LocalMusic, Icons.Default.LibraryMusic, appText("音乐", "Music")),
+            Triple(Screen.PlayerView, Icons.Default.PlayCircle, appText("播放", "Player")),
+            Triple(Screen.Equalizer, Icons.Default.Equalizer, appText("均衡", "EQ")),
+            Triple(Screen.Settings, Icons.Default.Settings, appText("设置", "Settings"))
+        )
+        Row(
+            modifier = dockModifier
+                .fillMaxWidth()
+                .height(62.dp)
+                .padding(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            destinations.forEach { (screen, icon, label) ->
+                val selected = selectedScreen == screen
+                Surface(
+                    onClick = { onNavigate(screen) },
+                    modifier = Modifier
+                        .weight(if (selected) 1.28f else 0.9f)
+                        .fillMaxHeight(),
+                    shape = RoundedCornerShape(28.dp),
+                    color = if (selected) {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    } else {
+                        Color.Transparent
+                    },
+                    contentColor = if (selected) {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    tonalElevation = if (selected) 2.dp else 0.dp
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        if (selected) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = label,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+
     NavigationBar(
-        modifier = dockModifier,
-        containerColor = if (floating) Color.Transparent else NavigationBarDefaults.containerColor,
-        tonalElevation = 0.dp,
+        modifier = dockModifier.height(if (floating) 72.dp else 80.dp),
+        containerColor = if (floating) Color.Transparent else MaterialTheme.colorScheme.surfaceContainer,
+        tonalElevation = 3.dp,
         windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
     ) {
         NavigationBarItem(
@@ -2239,28 +2165,28 @@ private fun MusicDock(
             onClick = { onNavigate(Screen.LocalMusic) },
             icon = { Icon(Icons.Default.LibraryMusic, appText("音乐", "Music")) },
             label = { Text(appText("音乐", "Music")) },
-            colors = if (floating) floatingItemColors else NavigationBarItemDefaults.colors()
+            colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.PlayerView,
             onClick = { onNavigate(Screen.PlayerView) },
             icon = { Icon(Icons.Default.PlayCircle, appText("播放", "Player")) },
             label = { Text(appText("播放", "Player")) },
-            colors = if (floating) floatingItemColors else NavigationBarItemDefaults.colors()
+            colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.Equalizer,
             onClick = { onNavigate(Screen.Equalizer) },
             icon = { Icon(Icons.Default.Equalizer, appText("均衡器", "Equalizer")) },
             label = { Text(appText("均衡器", "Equalizer")) },
-            colors = if (floating) floatingItemColors else NavigationBarItemDefaults.colors()
+            colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.Settings,
             onClick = { onNavigate(Screen.Settings) },
             icon = { Icon(Icons.Default.Settings, appText("设置", "Settings")) },
             label = { Text(appText("设置", "Settings")) },
-            colors = if (floating) floatingItemColors else NavigationBarItemDefaults.colors()
+            colors = md3ItemColors
         )
     }
 }
@@ -3066,17 +2992,98 @@ fun MD3MiniPlayer(
     onClick: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
-    onSeek: (Float) -> Unit
+    onSeek: (Float) -> Unit,
+    compactFloating: Boolean = false
 ) {
     val artwork = rememberArtwork(song, maxPx = 128)
     var sliderPosition by remember(progress) { mutableFloatStateOf(progress) }
 
+    if (compactFloating) {
+        Surface(
+            shape = RoundedCornerShape(32.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.58f),
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            tonalElevation = 6.dp,
+            shadowElevation = 12.dp,
+            border = BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)
+            ),
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable { onClick() }
+        ) {
+            Box {
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 8.dp, vertical = 7.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (artwork != null) {
+                        androidx.compose.foundation.Image(
+                            bitmap = artwork.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Surface(
+                            modifier = Modifier.size(36.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Default.MusicNote,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.size(21.dp)
+                                )
+                            }
+                        }
+                    }
+                    FilledIconButton(
+                        onClick = onTogglePlay,
+                        modifier = Modifier.size(38.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (isPlaying) appText("暂停", "Pause") else appText("播放", "Play"),
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                LinearProgressIndicator(
+                    progress = { progress.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(3.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = Color.Transparent
+                )
+            }
+        }
+        return
+    }
+
     Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        tonalElevation = 8.dp,
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        tonalElevation = 3.dp,
+        shadowElevation = 6.dp,
         modifier = Modifier
             .fillMaxWidth()
-            .height(84.dp)
+            .height(92.dp)
+            .padding(horizontal = 8.dp, vertical = 4.dp)
             .clickable { onClick() }
     ) {
         Column {
@@ -3090,12 +3097,17 @@ fun MD3MiniPlayer(
                     androidx.compose.foundation.Image(
                         artwork.asImageBitmap(),
                         null,
-                        Modifier.size(56.dp),
+                        Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(16.dp)),
                         contentScale = ContentScale.Crop
                     )
                 } else {
                     Box(
-                        Modifier.size(56.dp).background(MaterialTheme.colorScheme.primaryContainer),
+                        Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(MaterialTheme.colorScheme.primaryContainer),
                         Alignment.Center
                     ) {
                         Icon(Icons.Default.MusicNote, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(28.dp))
@@ -3108,7 +3120,10 @@ fun MD3MiniPlayer(
                 }
                 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onPrevious) {
+                    IconButton(
+                        onClick = onPrevious,
+                        modifier = Modifier.size(40.dp)
+                    ) {
                         Icon(Icons.Default.SkipPrevious, null)
                     }
                     IconButton(
@@ -3121,7 +3136,10 @@ fun MD3MiniPlayer(
                     ) {
                         Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null, Modifier.size(28.dp))
                     }
-                    IconButton(onClick = onNext) {
+                    IconButton(
+                        onClick = onNext,
+                        modifier = Modifier.size(40.dp)
+                    ) {
                         Icon(Icons.Default.SkipNext, null)
                     }
                 }

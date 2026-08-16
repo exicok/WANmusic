@@ -4,10 +4,18 @@ import android.content.Context
 import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.DirectionsCar
@@ -19,6 +27,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -29,7 +39,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
@@ -46,6 +58,12 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
     var overlayEnabled by remember {
         mutableStateOf(OverlayLyricsService.isEnabled(context) || OverlayLyricsService.isRunning())
     }
+    val initialOverlayStyle = remember { OverlayLyricsStyle.load(context) }
+    var overlayBackgroundEnabled by remember { mutableStateOf(initialOverlayStyle.backgroundEnabled) }
+    var overlayBackgroundColor by remember { mutableStateOf(initialOverlayStyle.backgroundColor) }
+    var overlayTextColor by remember { mutableStateOf(initialOverlayStyle.textColor) }
+    var overlayTextSize by remember { mutableStateOf(initialOverlayStyle.textSizeSp) }
+    var overlayFontFamily by remember { mutableStateOf(initialOverlayStyle.fontFamily) }
     var carLyricsEnabled by remember {
         mutableStateOf(preferences.getBoolean("car_lyrics_enabled", true))
     }
@@ -100,6 +118,11 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
         LyricsProviderNotifier.notifyChanged(context, force = true)
     }
 
+    fun saveOverlayStyle(block: android.content.SharedPreferences.Editor.() -> Unit) {
+        preferences.edit { block() }
+        OverlayLyricsService.refreshStyle(context)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -136,6 +159,85 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
                 },
                 modifier = Modifier.clickable { setOverlayLyrics(!overlayEnabled) }
             )
+
+            ListItem(
+                headlineContent = { Text("歌词背景") },
+                supportingContent = { Text(if (overlayBackgroundEnabled) "显示自定义背景色" else "关闭背景，仅显示歌词") },
+                trailingContent = {
+                    Switch(
+                        checked = overlayBackgroundEnabled,
+                        onCheckedChange = {
+                            overlayBackgroundEnabled = it
+                            saveOverlayStyle { putBoolean(OverlayLyricsStyle.KEY_BACKGROUND_ENABLED, it) }
+                        }
+                    )
+                },
+                modifier = Modifier.clickable {
+                    overlayBackgroundEnabled = !overlayBackgroundEnabled
+                    saveOverlayStyle {
+                        putBoolean(OverlayLyricsStyle.KEY_BACKGROUND_ENABLED, overlayBackgroundEnabled)
+                    }
+                }
+            )
+
+            ListItem(
+                headlineContent = { Text("背景色") },
+                supportingContent = { Text("选择悬浮歌词容器颜色") }
+            )
+            OverlayColorSelector(
+                colors = listOf(0xCC000000.toInt(), 0xCC202124.toInt(), 0xCC263238.toInt(), 0xCC3E2723.toInt(), 0xCC1A237E.toInt()),
+                selected = overlayBackgroundColor,
+                enabled = overlayBackgroundEnabled,
+                onSelected = {
+                    overlayBackgroundColor = it
+                    saveOverlayStyle { putInt(OverlayLyricsStyle.KEY_BACKGROUND_COLOR, it) }
+                }
+            )
+
+            ListItem(
+                headlineContent = { Text("歌词颜色") },
+                supportingContent = { Text("已播放歌词和标题使用此颜色") }
+            )
+            OverlayColorSelector(
+                colors = listOf(0xFFFFFFFF.toInt(), 0xFFFFD54F.toInt(), 0xFF80DEEA.toInt(), 0xFFA5D6A7.toInt(), 0xFFF48FB1.toInt()),
+                selected = overlayTextColor,
+                onSelected = {
+                    overlayTextColor = it
+                    saveOverlayStyle { putInt(OverlayLyricsStyle.KEY_TEXT_COLOR, it) }
+                }
+            )
+
+            ListItem(
+                headlineContent = { Text("歌词字号") },
+                supportingContent = { Text("${overlayTextSize.toInt()}sp") }
+            )
+            Slider(
+                value = overlayTextSize,
+                onValueChange = { overlayTextSize = it },
+                onValueChangeFinished = {
+                    saveOverlayStyle { putFloat(OverlayLyricsStyle.KEY_TEXT_SIZE, overlayTextSize) }
+                },
+                valueRange = 12f..36f,
+                steps = 23,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)
+            )
+
+            ListItem(headlineContent = { Text("歌词字体") })
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf("sans" to "系统", "serif" to "衬线", "mono" to "等宽").forEach { (value, label) ->
+                    FilterChip(
+                        selected = overlayFontFamily == value,
+                        onClick = {
+                            overlayFontFamily = value
+                            saveOverlayStyle { putString(OverlayLyricsStyle.KEY_FONT_FAMILY, value) }
+                        },
+                        label = { Text(label) }
+                    )
+                }
+            }
 
             SettingsSectionHeader("车载")
             ListItem(
@@ -184,6 +286,33 @@ fun LyricsAndDevicesSettingsScreen(onBack: () -> Unit) {
                     Text("从系统桌面的小部件列表添加，可显示专辑图、歌词并控制播放")
                 },
                 leadingContent = { Icon(Icons.Default.Widgets, null) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun OverlayColorSelector(
+    colors: List<Int>,
+    selected: Int,
+    enabled: Boolean = true,
+    onSelected: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        colors.forEach { color ->
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .background(ComposeColor(color), CircleShape)
+                    .border(
+                        width = if (selected == color) 3.dp else 1.dp,
+                        color = if (selected == color) ComposeColor.White else ComposeColor.White.copy(alpha = 0.35f),
+                        shape = CircleShape
+                    )
+                    .clickable(enabled = enabled) { onSelected(color) }
             )
         }
     }

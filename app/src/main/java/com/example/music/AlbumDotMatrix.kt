@@ -17,6 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -51,6 +52,12 @@ object AlbumDotMatrixSettings {
         private set
     var visualizerDepthEnabled by mutableStateOf(true)
         private set
+    var jumpStrength by mutableFloatStateOf(1.15f)
+        private set
+    var manualYaw by mutableFloatStateOf(10f)
+        private set
+    var manualPitch by mutableFloatStateOf(12f)
+        private set
 
     fun load(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -61,6 +68,9 @@ object AlbumDotMatrixSettings {
         rotationSpeed = prefs.getFloat("album_dot_matrix_rotation_speed", 0.45f).coerceIn(0.1f, 1.5f)
         depth = prefs.getFloat("album_dot_matrix_depth", 0.55f).coerceIn(0f, 1f)
         visualizerDepthEnabled = prefs.getBoolean("album_dot_matrix_visualizer_depth", true)
+        jumpStrength = prefs.getFloat("album_dot_matrix_jump_strength", 1.15f).coerceIn(0f, 2f)
+        manualYaw = prefs.getFloat("album_dot_matrix_manual_yaw", 10f)
+        manualPitch = prefs.getFloat("album_dot_matrix_manual_pitch", 12f).coerceIn(-62f, 62f)
     }
 
     fun setEnabled(context: Context, value: Boolean) {
@@ -103,6 +113,22 @@ object AlbumDotMatrixSettings {
         visualizerDepthEnabled = value
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit { putBoolean("album_dot_matrix_visualizer_depth", value) }
     }
+
+    fun setJumpStrength(context: Context, value: Float) {
+        jumpStrength = value.coerceIn(0f, 2f)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putFloat("album_dot_matrix_jump_strength", jumpStrength)
+        }
+    }
+
+    fun setManualRotation(context: Context, yaw: Float, pitch: Float) {
+        manualYaw = ((yaw % 360f) + 360f) % 360f
+        manualPitch = pitch.coerceIn(-62f, 62f)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putFloat("album_dot_matrix_manual_yaw", manualYaw)
+            putFloat("album_dot_matrix_manual_pitch", manualPitch)
+        }
+    }
 }
 
 @Composable
@@ -111,8 +137,9 @@ fun DotMatrixArtwork(
     visualizerEnergy: Float = 0f,
     modifier: Modifier = Modifier
 ) {
-    var manualYaw by remember { mutableFloatStateOf(-45f) }
-    var manualPitch by remember { mutableFloatStateOf(12f) }
+    val context = LocalContext.current
+    var manualYaw by remember { mutableFloatStateOf(AlbumDotMatrixSettings.manualYaw) }
+    var manualPitch by remember { mutableFloatStateOf(AlbumDotMatrixSettings.manualPitch) }
     val requestedColumns = AlbumDotMatrixSettings.columns
     val requestedDotScale = AlbumDotMatrixSettings.dotScale
     val randomDots = remember(bitmap, requestedColumns) {
@@ -149,8 +176,11 @@ fun DotMatrixArtwork(
     val depthAmount = AlbumDotMatrixSettings.depth
     val energy = if (AlbumDotMatrixSettings.visualizerDepthEnabled) visualizerEnergy.coerceIn(0f, 1f) else 0f
     Canvas(
-        modifier = modifier.pointerInput(Unit) {
-            detectDragGestures { change, dragAmount ->
+        modifier = modifier.pointerInput(context) {
+            detectDragGestures(
+                onDragEnd = { AlbumDotMatrixSettings.setManualRotation(context, manualYaw, manualPitch) },
+                onDragCancel = { AlbumDotMatrixSettings.setManualRotation(context, manualYaw, manualPitch) }
+            ) { change, dragAmount ->
                 change.consume()
                 manualYaw = (manualYaw + dragAmount.x * 0.55f) % 360f
                 manualPitch = (manualPitch - dragAmount.y * 0.42f).coerceIn(-62f, 62f)
@@ -162,19 +192,19 @@ fun DotMatrixArtwork(
         randomDots.forEach { dot ->
                 val nx = dot.x
                 val ny = dot.y
-                val lyricJump = sin(dot.jumpPhase + energy * PI.toFloat()) * energy
-                val sourceZ = dot.baseDepth * depthAmount + lyricJump * depthAmount * 0.46f
+                val beatJump = sin(dot.jumpPhase + energy * PI.toFloat()) * energy
+                val sourceZ = dot.baseDepth * depthAmount + beatJump * depthAmount * AlbumDotMatrixSettings.jumpStrength
                 val rotatedX = nx * cos(rotationRadians) + sourceZ * sin(rotationRadians)
                 val rotatedZ = -nx * sin(rotationRadians) + sourceZ * cos(rotationRadians)
                 val tiltedY = ny * cos(tiltRadians) - rotatedZ * sin(tiltRadians)
                 val tiltedZ = ny * sin(tiltRadians) + rotatedZ * cos(tiltRadians)
-                val perspective = (1f / (1f + tiltedZ * 0.28f)).coerceIn(0.68f, 1.42f)
+                val perspective = (1f / (1f + tiltedZ * 0.24f)).coerceIn(0.72f, 1.32f)
                 drawCircle(
                     color = dot.color,
                     radius = radius * dot.sizeJitter * perspective,
                     center = Offset(
-                        x = size.width * 0.5f + rotatedX * size.width * 0.47f * perspective,
-                        y = size.height * 0.5f + tiltedY * size.height * 0.47f * perspective
+                        x = size.width * 0.5f + rotatedX * size.width * 0.39f * perspective,
+                        y = size.height * 0.5f + tiltedY * size.height * 0.39f * perspective
                     )
                 )
         }

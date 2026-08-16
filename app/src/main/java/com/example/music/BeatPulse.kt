@@ -33,6 +33,7 @@ fun rememberBeatEnergy(
     var sessionId by remember { mutableIntStateOf(AudioSessionHolder.sessionId) }
     var useVisualizer by remember { mutableStateOf(false) }
     var smoothed by remember { mutableFloatStateOf(0f) }
+    var lastVisualizerUpdateMs by remember { mutableStateOf(0L) }
 
     // 轮询会话 ID（播放服务异步挂载）
     LaunchedEffect(isPlaying, effectiveEnabled) {
@@ -53,14 +54,18 @@ fun rememberBeatEnergy(
             onDispose { }
         } else {
             val listener: (ByteArray) -> Unit = { fft ->
-                val raw = SharedAudioVisualizer.bassEnergy(fft)
-                smoothed = if (raw > smoothed) {
-                    smoothed * 0.25f + raw * 0.75f
-                } else {
-                    smoothed * 0.82f + raw * 0.18f
+                val now = SystemClock.uptimeMillis()
+                if (now - lastVisualizerUpdateMs >= 100L) {
+                    lastVisualizerUpdateMs = now
+                    val raw = SharedAudioVisualizer.bassEnergy(fft)
+                    smoothed = if (raw > smoothed) {
+                        smoothed * 0.25f + raw * 0.75f
+                    } else {
+                        smoothed * 0.82f + raw * 0.18f
+                    }
+                    energy = smoothed.coerceIn(0f, 1f)
+                    useVisualizer = true
                 }
-                energy = smoothed.coerceIn(0f, 1f)
-                useVisualizer = true
             }
             SharedAudioVisualizer.addListener(listener)
             SharedAudioVisualizer.onSessionChanged(AudioSessionHolder.sessionId)
@@ -82,11 +87,11 @@ fun rememberBeatEnergy(
             if (!isPlaying) {
                 energy = (energy * 0.85f).coerceAtLeast(0f)
                 if (energy < 0.01f) energy = 0f
-                delay(32)
+                delay(100L)
                 continue
             }
             if (useVisualizer && SharedAudioVisualizer.isAttached && sessionId > 0) {
-                delay(80)
+                delay(100L)
                 continue
             }
             // 合成节拍兜底
@@ -101,7 +106,7 @@ fun rememberBeatEnergy(
             } else {
                 energy * 0.8f + pulse * 0.2f
             }
-            delay(16L)
+            delay(100L)
         }
     }
 
