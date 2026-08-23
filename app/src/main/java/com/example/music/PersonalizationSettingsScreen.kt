@@ -274,17 +274,27 @@ fun PersonalizationSettingsScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
             )
             ListItem(
-                headlineContent = { Text(appText("跳动区间", "Jump range")) },
-                supportingContent = { Text(String.format("%.2fx", AlbumDotMatrixSettings.jumpStrength)) }
+                headlineContent = { Text(appText("点阵形状", "Dot shape")) },
+                supportingContent = { Text(appText("修改专辑点阵的像素外观", "Change the pixel shape used by the album matrix")) }
             )
-            Slider(
-                value = AlbumDotMatrixSettings.jumpStrength,
-                onValueChange = { AlbumDotMatrixSettings.setJumpStrength(context, it) },
-                valueRange = 0f..2f,
-                steps = 19,
-                enabled = AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
-            )
+            SingleChoiceSegmentedButtonRow(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+            ) {
+                listOf(
+                    "circle" to appText("圆形", "Circle"),
+                    "square" to appText("方形", "Square"),
+                    "diamond" to appText("菱形", "Diamond")
+                ).forEachIndexed { index, (shape, label) ->
+                    SegmentedButton(
+                        selected = AlbumDotMatrixSettings.dotShape == shape,
+                        onClick = { AlbumDotMatrixSettings.setDotShape(context, shape) },
+                        shape = SegmentedButtonDefaults.itemShape(index, 3),
+                        enabled = AlbumDotMatrixSettings.enabled
+                    ) {
+                        Text(label)
+                    }
+                }
+            }
             ListItem(
                 headlineContent = { Text("AMOLED") },
                 supportingContent = { Text(appText("深色模式使用纯黑背景", "Use a pure black background in dark mode")) },

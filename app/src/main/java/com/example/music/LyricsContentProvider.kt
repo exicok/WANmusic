@@ -62,12 +62,20 @@ class LyricsContentProvider : ContentProvider() {
                 columns.LINE_END_MS,
                 columns.LINE_PROGRESS,
                 columns.PLAYED_CODE_POINTS,
-                columns.TOTAL_CODE_POINTS
+                columns.TOTAL_CODE_POINTS,
+                columns.NEXT_LINE,
+                columns.TRANSLATION,
+                columns.DATA_VERSION
             )
         )
         if (includeData) {
             val snapshot = LyricsStateHolder.snapshot()
-            val line = snapshot.lineProgress
+            val offsetMs = context
+                ?.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                ?.getFloat("lyrics_offset_ms", 0f)
+                ?.toLong()
+                ?: 0L
+            val line = LyricsStateHolder.resolveLineProgress((snapshot.position + offsetMs).coerceAtLeast(0L))
             cursor.addRow(
                 arrayOf<Any?>(
                     snapshot.title,
@@ -76,13 +84,16 @@ class LyricsContentProvider : ContentProvider() {
                     snapshot.position,
                     snapshot.duration,
                     if (snapshot.isPlaying) 1 else 0,
-                    line?.line.orEmpty(),
+                    line?.line?.substringBefore('\n').orEmpty(),
                     line?.lineIndex ?: -1,
                     line?.lineBegin ?: 0L,
                     line?.lineEnd ?: 0L,
                     line?.progress ?: 0f,
                     line?.playedCodePoints ?: 0,
-                    line?.totalCodePoints ?: 0
+                    line?.totalCodePoints ?: 0,
+                    nextLyricLine(snapshot, line?.lineBegin),
+                    line?.line?.substringAfter('\n', "").orEmpty(),
+                    LyricsProviderContract.VERSION
                 )
             )
         }
@@ -104,6 +115,15 @@ class LyricsContentProvider : ContentProvider() {
             cursor.setNotificationUri(it, LyricsProviderContract.LYRICS_URI)
         }
         return cursor
+    }
+
+    private fun nextLyricLine(snapshot: LyricsStateHolder.StateSnapshot, currentLineBegin: Long?): String {
+        val current = currentLineBegin ?: Long.MIN_VALUE
+        return snapshot.lyrics.asSequence()
+            .filter { it.first > current }
+            .map { it.second }
+            .firstOrNull()
+            .orEmpty()
     }
 
     private fun isEnabled(): Boolean = context

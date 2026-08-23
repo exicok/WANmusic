@@ -21,10 +21,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
@@ -38,6 +34,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
@@ -49,9 +46,7 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.MusicOff
-import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -61,7 +56,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -69,6 +63,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -95,7 +90,6 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.music.ui.theme.MusicTheme
@@ -106,7 +100,6 @@ import io.github.proify.lyricon.lyric.model.Song as LyriconSong
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.LyricWord
 import java.io.File
-import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.FutureTask
@@ -638,15 +631,15 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(playerLandscape) { prefs.edit { putBoolean("player_landscape", playerLandscape) } }
 
             MusicTheme(dynamicColor = false, amoledMode = isAmoledMode) {
-                    Surface(
-                        modifier = Modifier.fillMaxSize(),
-                        color = MaterialTheme.colorScheme.background
-                    ) {
-                        val err = initError
-                        val currentPlayer = player
-                        when {
-                            err != null -> StartupErrorScreen(err)
-                            currentPlayer != null -> MusicApp(
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    val err = initError
+                    val currentPlayer = player
+                    when {
+                        err != null -> StartupErrorScreen(err)
+                        currentPlayer != null -> MusicApp(
                             player = currentPlayer,
                             initialDirs = savedDirs,
                             initialSongs = savedSongs,
@@ -660,22 +653,16 @@ class MainActivity : ComponentActivity() {
                             initialLastUri = lastUri,
                             initialLastPosition = lastPosition,
                             initialLastDuration = lastDuration
-                            )
-                            else -> Box(Modifier.fillMaxSize(), Alignment.Center) {
-                                CircularProgressIndicator()
-                            }
+                        )
+                        else -> Box(Modifier.fillMaxSize(), Alignment.Center) {
+                            CircularProgressIndicator()
                         }
                     }
                 }
             }
         }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        // Controller is automatically released when activity is destroyed? 
-        // No, we should release it if we were managing it manually, but buildAsync handles it mostly.
-        // Actually, MediaController should be released.
     }
+
 }
 
 data class Song(
@@ -1083,7 +1070,26 @@ fun MusicApp(
                         if (!AppAnimationSettings.enabled) {
                             EnterTransition.None togetherWith ExitTransition.None
                         } else {
-                            fadeIn() togetherWith fadeOut()
+                            val duration = 320
+                            (
+                                slideInVertically(
+                                    animationSpec = tween(durationMillis = duration),
+                                    initialOffsetY = { fullHeight -> (fullHeight * 0.10f).toInt() }
+                                ) + fadeIn(animationSpec = tween(180), initialAlpha = 0.18f) + scaleIn(
+                                    initialScale = 0.92f,
+                                    transformOrigin = TransformOrigin(0.5f, 1f),
+                                    animationSpec = tween(durationMillis = duration)
+                                )
+                            ) togetherWith (
+                                slideOutVertically(
+                                    animationSpec = tween(durationMillis = duration),
+                                    targetOffsetY = { fullHeight -> (fullHeight * 0.08f).toInt() }
+                                ) + fadeOut(animationSpec = tween(140), targetAlpha = 0.0f) + scaleOut(
+                                    targetScale = 0.96f,
+                                    transformOrigin = TransformOrigin(0.5f, 1f),
+                                    animationSpec = tween(durationMillis = duration)
+                                )
+                            )
                         }
                     },
                     label = "ScreenTransition"
@@ -1214,15 +1220,6 @@ fun MusicApp(
                             isScanning = isScanning,
                             onScanNow = { triggerScan() }
                         ) { handleBack() }
-                        Screen.WebDav -> WebDavSettingsScreen(
-                            onBack = handleBack,
-                            onSongsLoaded = { remoteSongs ->
-                                songs = (songs.filterNot { it.artist == "WebDAV" } + remoteSongs)
-                                mediaItemsList = songs.map { buildMediaItem(it) }
-                                mediaItemsReady = true
-                                scheduleScanRecordsSave(songs)
-                            }
-                        )
                         Screen.Data -> DataSettingsScreen(
                             onBack = handleBack,
                             onRestart = restartActivity
@@ -1741,24 +1738,51 @@ fun SettingsMenu(
                 onNavigate(Screen.Personalization)
             }
             SettingsSectionHeader(appText("播放与声音", "Playback and audio"))
-            SettingsItem(appText("播放设置", "Playback settings"), Icons.Default.GraphicEq) { onNavigate(Screen.Playback) }
+            SettingsItem(
+                appText("播放设置", "Playback settings"),
+                Icons.Default.GraphicEq,
+                appText("控制播放行为、切歌逻辑和基础播放体验。", "Controls playback behavior, track switching, and the basic playback experience.")
+            ) { onNavigate(Screen.Playback) }
             SettingsItem(appText("音频输出与增益", "Audio output and gain"), Icons.Default.Speaker) {
                 onNavigate(Screen.AudioOutput)
             }
-            SettingsItem(appText("音频解码支持", "Audio codec support"), Icons.Default.AudioFile) { onNavigate(Screen.AudioCodecs) }
+            SettingsItem(
+                appText("音频解码支持", "Audio codec support"),
+                Icons.Default.AudioFile,
+                appText("查看并管理当前设备支持的音频解码器。", "View and manage the audio decoders supported by this device.")
+            ) { onNavigate(Screen.AudioCodecs) }
             SettingsSectionHeader(appText("歌词与连接", "Lyrics and connections"))
-            SettingsItem(appText("歌词设置", "Lyrics settings"), Icons.Default.Lyrics) {
+            SettingsItem(
+                appText("歌词设置", "Lyrics settings"),
+                Icons.Default.Lyrics,
+                appText("配置歌词来源、显示方式和逐字效果。", "Configure lyric sources, presentation, and per-word effects.")
+            ) {
                 onNavigate(Screen.LyricsSettings)
             }
-            SettingsItem(appText("外部设备与服务", "External devices and services"), Icons.Default.Subtitles) {
+            SettingsItem(
+                appText("外部设备与服务", "External devices and services"),
+                Icons.Default.Subtitles,
+                appText("连接外部播放器、桌面歌词和系统集成能力。", "Connect external players, desktop lyrics, and system integrations.")
+            ) {
                 onNavigate(Screen.LyricsAndDevices)
             }
             SettingsSectionHeader(appText("音乐来源", "Music sources"))
-            SettingsItem(appText("音乐库", "Music library"), Icons.Default.LibraryMusic) { onNavigate(Screen.Library) }
-            SettingsItem(appText("WebDAV 音乐源", "WebDAV source"), Icons.Default.CloudQueue) { onNavigate(Screen.WebDav) }
+            SettingsItem(
+                appText("音乐库", "Music library"),
+                Icons.Default.LibraryMusic,
+                appText("管理本地音乐目录、扫描结果和曲库内容。", "Manage local music folders, scan results, and the library contents.")
+            ) { onNavigate(Screen.Library) }
             SettingsSectionHeader(appText("数据与支持", "Data and support"))
-            SettingsItem(appText("数据", "Data"), Icons.Default.Storage) { onNavigate(Screen.Data) }
-            SettingsItem(appText("关于与支持", "About and support"), Icons.Default.Info) { onNavigate(Screen.AboutSupport) }
+            SettingsItem(
+                appText("数据", "Data"),
+                Icons.Default.Storage,
+                appText("导入、导出、清理和重置应用数据。", "Import, export, clear, and reset app data.")
+            ) { onNavigate(Screen.Data) }
+            SettingsItem(
+                appText("关于与支持", "About and support"),
+                Icons.Default.Info,
+                appText("查看版本信息、项目说明和支持入口。", "View version info, project notes, and support links.")
+            ) { onNavigate(Screen.AboutSupport) }
         }
     }
 }
@@ -1845,59 +1869,6 @@ private fun AudioCodecSupportScreen(onBack: () -> Unit) {
             }
         }
     }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun WebDavSettingsScreen(onBack: () -> Unit, onSongsLoaded: (List<Song>) -> Unit) {
-    val dockContentPadding = LocalDockContentPadding.current
-    val context = LocalContext.current
-    val saved = remember { WebDavRepository.load(context) }
-    var url by remember { mutableStateOf(saved.url) }
-    var username by remember { mutableStateOf(saved.username) }
-    var password by remember { mutableStateOf(saved.password) }
-    var status by remember { mutableStateOf("") }
-    var scanning by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-    Scaffold(topBar = {
-        TopAppBar(title = { Text("WebDAV 音乐源") }, navigationIcon = {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
-        })
-    }) { padding ->
-        Column(
-            Modifier
-                .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState())
-                .padding(bottom = dockContentPadding),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Text("连接远程音乐目录", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), label = { Text("WebDAV 地址") }, placeholder = { Text("https://example.com/dav/music/") }, singleLine = true)
-            OutlinedTextField(username, { username = it }, Modifier.fillMaxWidth(), label = { Text("用户名") }, singleLine = true)
-            OutlinedTextField(password, { password = it }, Modifier.fillMaxWidth(), label = { Text("密码") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
-            Button(
-                onClick = {
-                    val config = WebDavConfig(url.trim(), username, password)
-                    WebDavRepository.save(context, config)
-                    context.startService(Intent(context, PlaybackService::class.java).setAction(PlaybackService.ACTION_REFRESH_WEBDAV_AUTH))
-                    scanning = true
-                    status = "正在扫描…"
-                    scope.launch {
-                        runCatching { withContext(Dispatchers.IO) { WebDavRepository.scan(config) } }
-                            .onSuccess { songs -> onSongsLoaded(songs); status = "已找到 ${songs.size} 首音乐" }
-                            .onFailure { status = "扫描失败：${it.message ?: "连接错误"}" }
-                        scanning = false
-                    }
-                },
-                enabled = !scanning && url.isNotBlank(),
-                modifier = Modifier.fillMaxWidth()
-            ) { Text(if (scanning) "扫描中…" else "保存并扫描") }
-            if (status.isNotBlank()) Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("支持 MP3、FLAC、WAV、M4A、OGG 等音频格式。播放远程歌曲时使用当前 WebDAV 账号。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-
 }
 
 @Composable
@@ -2093,6 +2064,14 @@ private fun MusicDock(
             Triple(Screen.Equalizer, Icons.Default.Equalizer, appText("均衡", "EQ")),
             Triple(Screen.Settings, Icons.Default.Settings, appText("设置", "Settings"))
         )
+        val dockItemAnimation = if (AppAnimationSettings.enabled) {
+            spring<Float>(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMediumLow
+            )
+        } else {
+            snap<Float>()
+        }
         Row(
             modifier = dockModifier
                 .fillMaxWidth()
@@ -2103,10 +2082,20 @@ private fun MusicDock(
         ) {
             destinations.forEach { (screen, icon, label) ->
                 val selected = selectedScreen == screen
+                val itemWeight by animateFloatAsState(
+                    targetValue = if (selected) 1.28f else 0.9f,
+                    animationSpec = dockItemAnimation,
+                    label = "FloatingDockWeight"
+                )
+                val itemProgress by animateFloatAsState(
+                    targetValue = if (selected) 1f else 0f,
+                    animationSpec = dockItemAnimation,
+                    label = "FloatingDockProgress"
+                )
                 Surface(
                     onClick = { onNavigate(screen) },
                     modifier = Modifier
-                        .weight(if (selected) 1.28f else 0.9f)
+                        .weight(itemWeight)
                         .fillMaxHeight(),
                     shape = RoundedCornerShape(28.dp),
                     color = if (selected) {
@@ -2121,31 +2110,49 @@ private fun MusicDock(
                     },
                     tonalElevation = if (selected) 2.dp else 0.dp
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        if (selected) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(7.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = icon,
-                                    contentDescription = label,
-                                    modifier = Modifier.size(20.dp)
-                                )
+                    AnimatedContent(
+                        targetState = selected,
+                        transitionSpec = {
+                            if (!AppAnimationSettings.enabled) {
+                                EnterTransition.None togetherWith ExitTransition.None
+                            } else {
+                                (fadeIn(tween(180)) + scaleIn(initialScale = 0.92f)) togetherWith
+                                    (fadeOut(tween(120)) + scaleOut(targetScale = 0.94f))
+                            }
+                        },
+                        label = "FloatingDockItem"
+                    ) { isSelected ->
+                        Box(contentAlignment = Alignment.Center) {
+                            if (isSelected) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = label,
+                                        modifier = Modifier
+                                            .size(20.dp)
+                                            .graphicsLayer {
+                                                scaleX = 0.92f + itemProgress * 0.12f
+                                                scaleY = 0.92f + itemProgress * 0.12f
+                                            }
+                                    )
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            } else {
                                 Text(
                                     text = label,
                                     style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
+                                    fontWeight = FontWeight.Medium,
                                     maxLines = 1
                                 )
                             }
-                        } else {
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1
-                            )
                         }
                     }
                 }
@@ -2163,29 +2170,129 @@ private fun MusicDock(
         NavigationBarItem(
             selected = selectedScreen == Screen.LocalMusic,
             onClick = { onNavigate(Screen.LocalMusic) },
-            icon = { Icon(Icons.Default.LibraryMusic, appText("音乐", "Music")) },
-            label = { Text(appText("音乐", "Music")) },
+            icon = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockLibraryIcon"
+                )
+                Icon(
+                    Icons.Default.LibraryMusic,
+                    appText("音乐", "Music"),
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = 0.9f + progress * 0.16f
+                        scaleY = 0.9f + progress * 0.16f
+                        alpha = 0.72f + progress * 0.28f
+                    }
+                )
+            },
+            label = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockLibraryLabel"
+                )
+                Text(
+                    appText("音乐", "Music"),
+                    modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
+                )
+            },
             colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.PlayerView,
             onClick = { onNavigate(Screen.PlayerView) },
-            icon = { Icon(Icons.Default.PlayCircle, appText("播放", "Player")) },
-            label = { Text(appText("播放", "Player")) },
+            icon = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.PlayerView) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockPlayerIcon"
+                )
+                Icon(
+                    Icons.Default.PlayCircle,
+                    appText("播放", "Player"),
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = 0.9f + progress * 0.16f
+                        scaleY = 0.9f + progress * 0.16f
+                        alpha = 0.72f + progress * 0.28f
+                    }
+                )
+            },
+            label = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.PlayerView) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockPlayerLabel"
+                )
+                Text(
+                    appText("播放", "Player"),
+                    modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
+                )
+            },
             colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.Equalizer,
             onClick = { onNavigate(Screen.Equalizer) },
-            icon = { Icon(Icons.Default.Equalizer, appText("均衡器", "Equalizer")) },
-            label = { Text(appText("均衡器", "Equalizer")) },
+            icon = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.Equalizer) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockEqIcon"
+                )
+                Icon(
+                    Icons.Default.Equalizer,
+                    appText("均衡器", "Equalizer"),
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = 0.9f + progress * 0.16f
+                        scaleY = 0.9f + progress * 0.16f
+                        alpha = 0.72f + progress * 0.28f
+                    }
+                )
+            },
+            label = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.Equalizer) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockEqLabel"
+                )
+                Text(
+                    appText("均衡器", "Equalizer"),
+                    modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
+                )
+            },
             colors = md3ItemColors
         )
         NavigationBarItem(
             selected = selectedScreen == Screen.Settings,
             onClick = { onNavigate(Screen.Settings) },
-            icon = { Icon(Icons.Default.Settings, appText("设置", "Settings")) },
-            label = { Text(appText("设置", "Settings")) },
+            icon = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.Settings) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockSettingsIcon"
+                )
+                Icon(
+                    Icons.Default.Settings,
+                    appText("设置", "Settings"),
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = 0.9f + progress * 0.16f
+                        scaleY = 0.9f + progress * 0.16f
+                        alpha = 0.72f + progress * 0.28f
+                    }
+                )
+            },
+            label = {
+                val progress by animateFloatAsState(
+                    targetValue = if (selectedScreen == Screen.Settings) 1f else 0f,
+                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
+                    label = "DockSettingsLabel"
+                )
+                Text(
+                    appText("设置", "Settings"),
+                    modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
+                )
+            },
             colors = md3ItemColors
         )
     }
@@ -2201,9 +2308,6 @@ fun PlaybackSettingsScreen(
     val dockContentPadding = LocalDockContentPadding.current
     val context = LocalContext.current
     val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
-    var artworkBeatEnabled by remember {
-        mutableStateOf(preferences.getBoolean("artwork_beat_enabled", true))
-    }
     var spectrumProgressEnabled by remember {
         mutableStateOf(preferences.getBoolean("spectrum_progress_enabled", true))
     }
@@ -2267,26 +2371,6 @@ fun PlaybackSettingsScreen(
                 }
             )
             SettingsSectionHeader(appText("播放页显示", "Player display"))
-            ListItem(
-                headlineContent = { Text(appText("专辑节奏跳动", "Artwork beat animation")) },
-                supportingContent = {
-                    Text(appText("播放时专辑封面跟随低频节奏缩放跳动", "Scale the artwork with low-frequency energy"))
-                },
-                leadingContent = { Icon(Icons.Default.BubbleChart, null) },
-                trailingContent = {
-                    Switch(
-                        checked = artworkBeatEnabled,
-                        onCheckedChange = {
-                            artworkBeatEnabled = it
-                            preferences.edit { putBoolean("artwork_beat_enabled", it) }
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    artworkBeatEnabled = !artworkBeatEnabled
-                    preferences.edit { putBoolean("artwork_beat_enabled", artworkBeatEnabled) }
-                }
-            )
             ListItem(
                 headlineContent = { Text(appText("频谱进度条", "Spectrum progress bar")) },
                 supportingContent = {
@@ -2626,32 +2710,42 @@ fun EqualizerSettingsScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             Text("十段参数均衡", style = MaterialTheme.typography.titleMedium, color = primary)
             Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.Bottom
+            ) {
             equalizerFrequencies.forEachIndexed { index, frequency ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(
+                    modifier = Modifier.width(42.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
                     Text(
                         text = formatEqualizerFrequency(frequency),
-                        modifier = Modifier.width(56.dp),
+                        maxLines = 1,
                         style = MaterialTheme.typography.labelLarge
                     )
-                    Slider(
-                        value = gains[index].toFloat(),
-                        onValueChange = { value ->
-                            gains = gains.copyOf().also { it[index] = value.toInt() }
-                            selectedPreset = "自定义"
-                            persistAndApply(nextGains = gains, presetName = "自定义")
-                        },
-                        valueRange = -15f..15f,
-                        steps = 29,
-                        enabled = eqEnabled,
-                        modifier = Modifier.weight(1f)
-                    )
+                    Box(modifier = Modifier.height(150.dp).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Slider(
+                            value = gains[index].toFloat(),
+                            onValueChange = { value ->
+                                gains = gains.copyOf().also { it[index] = value.toInt() }
+                                selectedPreset = "自定义"
+                                persistAndApply(nextGains = gains, presetName = "自定义")
+                            },
+                            valueRange = -15f..15f,
+                            steps = 29,
+                            enabled = eqEnabled,
+                            modifier = Modifier.fillMaxWidth().rotate(-90f)
+                        )
+                    }
                     Text(
                         text = String.format(Locale.getDefault(), "%+d dB", gains[index]),
-                        modifier = Modifier.width(62.dp),
                         textAlign = TextAlign.End,
                         style = MaterialTheme.typography.labelMedium
                     )
                 }
+            }
             }
 
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
@@ -3456,7 +3550,10 @@ fun FullPlayerScreen(
     fixedDockBottomPadding: androidx.compose.ui.unit.Dp = 0.dp
 ) {
     val configuration = LocalConfiguration.current
-    val artworkSize = if (isLandscape) minOf(360, (configuration.screenHeightDp * 0.52f).toInt()).dp else 300.dp
+    val baseArtworkSize = if (isLandscape) minOf(360, (configuration.screenHeightDp * 0.52f).toInt()).dp else 300.dp
+    val artworkShrink = if (AlbumDotMatrixSettings.enabled) 0.dp else with(LocalDensity.current) { 50f.toDp() }
+    val artworkSize = maxOf(baseArtworkSize - artworkShrink, 0.dp)
+    val artworkShape = RoundedCornerShape(if (isLandscape) 20.dp else 32.dp)
     val pagePadding = if (isLandscape) 16.dp else 32.dp
     val sectionPadding = if (isLandscape) 4.dp else 16.dp
     val floatingDockControlPadding = if (!floatingDockVisible) {
@@ -3490,21 +3587,16 @@ fun FullPlayerScreen(
     val playerPrefs = remember {
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
     }
-    var artworkBeatEnabled by remember {
-        mutableStateOf(playerPrefs.getBoolean("artwork_beat_enabled", true))
-    }
     var spectrumProgressEnabled by remember {
         mutableStateOf(playerPrefs.getBoolean("spectrum_progress_enabled", true))
     }
     // 从设置返回时刷新开关
     LaunchedEffect(song.uri, isPlaying) {
-        artworkBeatEnabled = playerPrefs.getBoolean("artwork_beat_enabled", true)
         spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
     }
     val beatEnergy = rememberBeatEnergy(
         isPlaying = isPlaying,
-        enabled = (artworkBeatEnabled ||
-            (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled)) &&
+        enabled = (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled) &&
             animationsEnabled
     )
     val beatScale by animateFloatAsState(
@@ -3700,9 +3792,15 @@ fun FullPlayerScreen(
             verticalArrangement = Arrangement.SpaceBetween
         ) {
             // 中部：歌词/专辑，带切换动画
-            Box(Modifier.weight(1f).fillMaxWidth(), Alignment.Center) {
+            Box(
+                Modifier
+                    .weight(1f)
+                    .requiredWidth(configuration.screenWidthDp.dp),
+                Alignment.Center
+            ) {
                 AnimatedContent(
                     targetState = showLyrics to song.uri,
+                    modifier = Modifier.fillMaxSize(),
                     transitionSpec = {
                         if (!animationsEnabled) {
                             EnterTransition.None togetherWith ExitTransition.None
@@ -3740,13 +3838,17 @@ fun FullPlayerScreen(
                                 bitmap = targetArtwork,
                                 contentDescription = null,
                                 visualizerEnergy = beatEnergy,
-                                modifier = Modifier
-                                    .size(artworkSize)
+                                modifier = (if (AlbumDotMatrixSettings.enabled) {
+                                    Modifier.fillMaxSize()
+                                } else {
+                                    Modifier
+                                        .size(artworkSize)
+                                        .clip(artworkShape)
+                                })
                                     .graphicsLayer {
                                         scaleX = beatScale
                                         scaleY = beatScale
                                     }
-                                    .clip(RoundedCornerShape(if (isLandscape) 20.dp else 32.dp))
                                     .clickable { showLyrics = true },
                             )
                         } else {
@@ -4130,21 +4232,37 @@ fun LyricView(
     val wordProgressEnabled = LyricsDisplaySettings.wordProgressEnabled
     val depthBlurEnabled = LyricsDisplaySettings.depthBlurEnabled
     val lyricFontScale = LyricsDisplaySettings.fontScale
+    val lyricAlignment = LyricsDisplaySettings.alignment
+    val lyricStyle = LyricsDisplaySettings.style
+    val lyricDirection = LyricsDisplaySettings.direction
+    val lyricScrollEffect = LyricsDisplaySettings.scrollEffect
+    val lyricAnimations = LyricsDisplaySettings.animationEnabled
+    val animationSpeed = LyricsDisplaySettings.animationSpeed
+    val autoFollow = LyricsDisplaySettings.autoFollow
+    val effectivePosition = (currentPosition + LyricsDisplaySettings.offsetMs.toLong()).coerceAtLeast(0L)
+    val currentLyricColor = Color(LyricsDisplaySettings.currentColorArgb)
+    val inactiveLyricColor = Color(LyricsDisplaySettings.inactiveColorArgb)
+    val lineTextAlign = when (lyricAlignment) {
+        "center" -> TextAlign.Center
+        "end" -> TextAlign.End
+        else -> TextAlign.Start
+    }
     if (lyrics.isEmpty()) {
         Box(Modifier.fillMaxSize(), Alignment.Center) { Text(appText("未找到歌词", "No lyrics found"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
         return
     }
     val displayLyrics = remember(lyrics) { groupBilingualLyrics(lyrics) }
-    val lineIdx = displayLyrics.indexOfLast { it.timestamp <= currentPosition }
+    val lineIdx = displayLyrics.indexOfLast { it.timestamp <= effectivePosition }
     val listState = rememberLazyListState()
     LaunchedEffect(
         lineIdx,
         configuration.orientation,
         configuration.screenHeightDp,
         lyricFontScale,
+        autoFollow,
         displayLyrics.size
     ) {
-        if (lineIdx >= 0) {
+        if (autoFollow && lineIdx >= 0) {
             val currentIndex = lineIdx.coerceAtMost(displayLyrics.lastIndex)
             withFrameNanos { }
             if (listState.layoutInfo.visibleItemsInfo.none { it.index == currentIndex }) {
@@ -4158,11 +4276,16 @@ fun LyricView(
             val viewportCenter =
                 (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2f
             val currentItemCenter = currentItem.offset + currentItem.size / 2f
-            listState.animateScrollBy(currentItemCenter - viewportCenter)
+            if (lyricScrollEffect == "instant") {
+                listState.scrollBy(currentItemCenter - viewportCenter)
+            } else {
+                listState.animateScrollBy(currentItemCenter - viewportCenter)
+            }
         }
     }
     LazyColumn(
         state = listState,
+        reverseLayout = lyricDirection == "bottom_up",
         modifier = Modifier
             .fillMaxHeight()
             .then(
@@ -4193,11 +4316,12 @@ fun LyricView(
                 ?: duration.takeIf { isCurrent && it > timestamp }
                 ?: (timestamp + 5_000L)
             val lineProgress = if (isCurrent) {
-                ((currentPosition - timestamp).toFloat() /
+                ((effectivePosition - timestamp).toFloat() /
                         (lineEnd - timestamp).coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
             } else {
                 0f
             }
+            val transitionDuration = if (lyricAnimations) (480 / animationSpeed).toInt().coerceAtLeast(120) else 0
             val textAlpha by animateFloatAsState(
                 targetValue = when {
                     isCurrent -> 1f
@@ -4205,12 +4329,12 @@ fun LyricView(
                     distanceFromCurrent == 2 -> 0.38f
                     else -> 0.22f
                 },
-                animationSpec = tween(480),
+                animationSpec = tween(transitionDuration),
                 label = "lyricAlpha"
             )
             val lyricIndent by animateDpAsState(
                 targetValue = if (isCurrent) 0.dp else 10.dp,
-                animationSpec = tween(480),
+                animationSpec = tween(transitionDuration),
                 label = "lyricIndent"
             )
             val lyricBlur by animateDpAsState(
@@ -4220,7 +4344,7 @@ fun LyricView(
                     distanceFromCurrent == 2 -> 1.4.dp
                     else -> 2.2.dp
                 },
-                animationSpec = tween(520),
+                animationSpec = tween(if (lyricAnimations) (520 / animationSpeed).toInt().coerceAtLeast(120) else 0),
                 label = "lyricBlur"
             )
             Column(
@@ -4230,25 +4354,50 @@ fun LyricView(
                         start = (if (edgeToEdge) 8.dp else 24.dp) + lyricIndent,
                         end = if (edgeToEdge) 8.dp else 24.dp
                     )
-                    .clickable { onSeek(timestamp) }
+                    .clickable {
+                        onSeek((timestamp - LyricsDisplaySettings.offsetMs.toLong()).coerceAtLeast(0L))
+                    }
                     .blur(lyricBlur)
                     .graphicsLayer {
                         alpha = textAlpha
+                        val activeScale = when (lyricStyle) {
+                            "immersive" -> 1.04f
+                            "compact" -> 1.01f
+                            else -> 1.025f
+                        }
+                        scaleX = if (isCurrent && lyricAnimations) activeScale else 1f
+                        scaleY = if (isCurrent && lyricAnimations) activeScale else 1f
                     },
+                horizontalAlignment = when (lyricAlignment) {
+                    "center" -> Alignment.CenterHorizontally
+                    "end" -> Alignment.End
+                    else -> Alignment.Start
+                }
             ) {
+                val currentSize = when (lyricStyle) {
+                    "compact" -> 26f
+                    "immersive" -> 34f
+                    else -> 30f
+                }
+                val inactiveSize = when (lyricStyle) {
+                    "compact" -> 18f
+                    "immersive" -> 24f
+                    else -> 22f
+                }
                 val textStyle = if (isCurrent) {
                     MaterialTheme.typography.headlineMedium.copy(
-                        fontSize = (30f * lyricFontScale).sp,
-                        lineHeight = (36f * lyricFontScale).sp,
+                        fontSize = (currentSize * lyricFontScale).sp,
+                        lineHeight = ((currentSize + 6f) * lyricFontScale).sp,
                         fontWeight = FontWeight.Black,
-                        textAlign = TextAlign.Start
+                        textAlign = lineTextAlign
                     )
                 } else {
                     MaterialTheme.typography.titleLarge.copy(
-                        fontSize = (22f * lyricFontScale).sp,
-                        lineHeight = (28f * lyricFontScale).sp,
+                        fontSize = (inactiveSize * lyricFontScale).sp,
+                        lineHeight = ((inactiveSize + 6f) * lyricFontScale).sp,
                         fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Start
+                        textAlign = lineTextAlign,
+                        color = inactiveLyricColor
                     )
                 }
                 if (isCurrent && wordProgressEnabled) {
@@ -4256,8 +4405,8 @@ fun LyricView(
                     val playedCharacterCount = (characterCount * lineProgress).toInt()
                         .coerceIn(0, characterCount)
                     val playedTextEnd = text.offsetByCodePoints(0, playedCharacterCount)
-                    val playedColor = MaterialTheme.colorScheme.onSurface
-                    val pendingColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                    val playedColor = currentLyricColor
+                    val pendingColor = currentLyricColor.copy(alpha = 0.32f)
                     val progressText = buildAnnotatedString {
                         if (playedTextEnd > 0) {
                             pushStyle(SpanStyle(color = playedColor))
@@ -4272,10 +4421,11 @@ fun LyricView(
                     }
                     Text(
                         text = progressText,
-                        style = textStyle
+                        style = textStyle,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 } else {
-                    Text(text = text, style = textStyle)
+                    Text(text = text, style = textStyle, color = if (isCurrent) currentLyricColor else inactiveLyricColor, modifier = Modifier.fillMaxWidth())
                 }
                 entry.translation?.let { translation ->
                     Text(
@@ -4283,12 +4433,11 @@ fun LyricView(
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontSize = (16f * lyricFontScale).sp,
                             lineHeight = (22f * lyricFontScale).sp,
-                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium
+                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium,
+                            textAlign = lineTextAlign
                         ),
-                        color = MaterialTheme.colorScheme.onSurface.copy(
-                            alpha = if (isCurrent) 0.72f else 0.48f
-                        ),
-                        modifier = Modifier.padding(top = 3.dp)
+                        color = if (isCurrent) currentLyricColor.copy(alpha = 0.72f) else inactiveLyricColor.copy(alpha = 0.6f),
+                        modifier = Modifier.fillMaxWidth().padding(top = 3.dp)
                     )
                 }
             }

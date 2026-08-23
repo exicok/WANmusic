@@ -4,7 +4,6 @@ sealed class Screen {
     data object Settings : Screen()
     data object Personalization : Screen()
     data object Library : Screen()
-    data object WebDav : Screen()
     data object Data : Screen()
     data object Playback : Screen()
     data object AudioOutput : Screen()
@@ -21,7 +20,7 @@ sealed class Screen {
         PlayerView -> LocalMusic
         Equalizer -> LocalMusic
         Settings -> LocalMusic
-        Library, WebDav, Data, Playback, AudioOutput, Personalization, LyricsAndDevices, LyricsSettings, AudioCodecs,
+        Library, Data, Playback, AudioOutput, Personalization, LyricsAndDevices, LyricsSettings, AudioCodecs,
         AboutSupport -> Settings
     }
 }

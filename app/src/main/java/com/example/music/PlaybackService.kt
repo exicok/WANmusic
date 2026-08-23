@@ -12,7 +12,6 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
@@ -43,7 +42,6 @@ class PlaybackService : MediaSessionService() {
     private var preampDb = 0
     private var bassBoostStrength = 0
     private var virtualizerStrength = 0
-    private lateinit var httpFactory: DefaultHttpDataSource.Factory
     private lateinit var dataSourceFactory: DefaultDataSource.Factory
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var lyricsBridgeJob: Job? = null
@@ -56,22 +54,23 @@ class PlaybackService : MediaSessionService() {
         const val ACTION_APPLY_EQUALIZER = "com.example.music.APPLY_EQUALIZER"
         const val ACTION_APPLY_AUDIO_OUTPUT = "com.example.music.APPLY_AUDIO_OUTPUT"
         const val ACTION_SET_AUDIO_GAIN = "com.example.music.SET_AUDIO_GAIN"
-        const val ACTION_REFRESH_WEBDAV_AUTH = "com.example.music.REFRESH_WEBDAV_AUTH"
+        const val ACTION_SET_PLAYER_VOLUME = "com.example.music.SET_PLAYER_VOLUME"
         const val EXTRA_GAINS = "gains"
         const val EXTRA_EQ_ENABLED = "eq_enabled"
         const val EXTRA_PREAMP = "preamp"
         const val EXTRA_BASS_BOOST = "bass_boost"
         const val EXTRA_VIRTUALIZER = "virtualizer"
         const val EXTRA_AUDIO_GAIN_DB = "audio_gain_db"
+        const val EXTRA_PLAYER_VOLUME = "player_volume"
+        const val EXTRA_PLAYER_MUTED = "player_muted"
         /** UI 10 段中心频率（Hz） */
         val EQUALIZER_FREQUENCIES = intArrayOf(31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000)
     }
 
     override fun onCreate() {
         super.onCreate()
-        httpFactory = DefaultHttpDataSource.Factory()
-        updateWebDavHeaders()
-        dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
+        MusicVolumeSettings.load(this)
+        dataSourceFactory = DefaultDataSource.Factory(this)
         val player = createPlayer()
         val forwardingPlayer = createSessionPlayer(player)
 
@@ -112,7 +111,7 @@ class PlaybackService : MediaSessionService() {
         delegate = player,
         scope = serviceScope,
         configProvider = { AudioOutputConfig.load(this) }
-    )
+    ).also { it.setVolume(MusicVolumeSettings.effectiveVolume()) }
 
     private fun attachPlayerListeners(player: ExoPlayer) {
         player.addListener(object : Player.Listener {
@@ -202,11 +201,18 @@ class PlaybackService : MediaSessionService() {
         val sessionId = activePlayer?.audioSessionId ?: AudioSessionHolder.sessionId
 
         when (intent?.action) {
-            ACTION_REFRESH_WEBDAV_AUTH -> updateWebDavHeaders()
             ACTION_APPLY_AUDIO_OUTPUT -> scheduleAudioOutputRebuild()
             ACTION_SET_AUDIO_GAIN -> AudioOutputRuntime.setGainDb(
                 intent.getFloatExtra(EXTRA_AUDIO_GAIN_DB, 0f)
             )
+            ACTION_SET_PLAYER_VOLUME -> {
+                val volume = intent.getFloatExtra(EXTRA_PLAYER_VOLUME, MusicVolumeSettings.volume)
+                    .coerceIn(0f, 1f)
+                val muted = intent.getBooleanExtra(EXTRA_PLAYER_MUTED, MusicVolumeSettings.muted)
+                MusicVolumeSettings.setVolume(this, volume)
+                MusicVolumeSettings.setMuted(this, muted)
+                sessionPlayer?.setVolume(MusicVolumeSettings.effectiveVolume())
+            }
             ACTION_APPLY_EQUALIZER -> {
                 intent.getIntArrayExtra(EXTRA_GAINS)?.let { pendingGains = it }
                 if (intent.hasExtra(EXTRA_EQ_ENABLED)) {
@@ -232,11 +238,6 @@ class PlaybackService : MediaSessionService() {
             LyricsWidgetProvider.ACTION_PREV -> player?.seekToPreviousMediaItem()
         }
         return super.onStartCommand(intent, flags, startId)
-    }
-
-    private fun updateWebDavHeaders() {
-        val auth = WebDavRepository.authorization(WebDavRepository.load(this))
-        httpFactory.setDefaultRequestProperties(if (auth == null) emptyMap() else mapOf("Authorization" to auth))
     }
 
     /**

@@ -13,6 +13,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speaker
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -46,6 +48,9 @@ fun AudioOutputSettingsScreen(onBack: () -> Unit) {
     }
     var config by remember { mutableStateOf(AudioOutputConfig.load(preferences)) }
     var applyStatus by remember { mutableStateOf("") }
+    remember(context) { MusicVolumeSettings.load(context) }
+    var playerVolume by remember { mutableStateOf(MusicVolumeSettings.volume) }
+    var playerMuted by remember { mutableStateOf(MusicVolumeSettings.muted) }
     val audioOutput = rememberAudioOutputSnapshot()
     val configuredLatencyMs = configuredOutputLatencyMs(config, audioOutput.sampleRateHz)
     val chinese = androidx.compose.ui.platform.LocalConfiguration.current.locales[0].language == "zh"
@@ -101,6 +106,44 @@ fun AudioOutputSettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(bottom = dockContentPadding)
         ) {
+            SettingsSectionHeader(appText("播放器音量", "Player volume"))
+            ListItem(
+                headlineContent = {
+                    Text(if (playerMuted) appText("已静音", "Muted") else "${(playerVolume * 100f).roundToInt()}%")
+                },
+                supportingContent = {
+                    Text(appText("仅作用于 WANmusic 播放器，不修改系统媒体音量", "Only affects WANmusic playback; system media volume is unchanged"))
+                },
+                leadingContent = {
+                    Icon(if (playerMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp, null)
+                },
+                trailingContent = {
+                    Switch(
+                        checked = playerMuted,
+                        onCheckedChange = {
+                            playerMuted = it
+                            MusicVolumeSettings.setMuted(context, it)
+                            sendPlayerVolume(context, playerVolume, it)
+                        }
+                    )
+                }
+            )
+            Slider(
+                value = playerVolume,
+                onValueChange = {
+                    playerVolume = it
+                    if (playerMuted) {
+                        playerMuted = false
+                        MusicVolumeSettings.setMuted(context, false)
+                    }
+                    MusicVolumeSettings.setVolume(context, it)
+                    sendPlayerVolume(context, it, false)
+                },
+                valueRange = 0f..1f,
+                steps = 19,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
+
             SettingsSectionHeader(appText("当前输出", "Current output"))
             ListItem(
                 headlineContent = { Text(audioOutput.summary) },
@@ -174,6 +217,16 @@ fun AudioOutputSettingsScreen(onBack: () -> Unit) {
                 )
             }
         }
+    }
+}
+
+private fun sendPlayerVolume(context: Context, volume: Float, muted: Boolean) {
+    runCatching {
+        context.startService(Intent(context, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_SET_PLAYER_VOLUME
+            putExtra(PlaybackService.EXTRA_PLAYER_VOLUME, volume)
+            putExtra(PlaybackService.EXTRA_PLAYER_MUTED, muted)
+        })
     }
 }
 

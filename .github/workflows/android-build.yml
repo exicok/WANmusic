@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build APK
+    name: Build integrated WANmusic APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -69,9 +69,10 @@ jobs:
       - name: Grant Gradle wrapper permission
         run: chmod +x gradlew
 
-      - name: Build debug APK
+      - name: Build integrated debug APK
         run: >-
-          ./gradlew :app:assembleDebug
+          ./gradlew
+          :app:assembleDebug
           --stacktrace
           -PWAN_VERSION_CODE=${{ steps.version.outputs.version_code }}
           -PWAN_VERSION_NAME=${{ steps.version.outputs.version_name }}
@@ -82,12 +83,19 @@ jobs:
           mkdir -p release-artifacts
           cp app/build/outputs/apk/debug/app-debug.apk \
             "release-artifacts/WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}.apk"
+          {
+            echo "## Android build outputs"
+            echo
+            echo "| Gradle module | APK |"
+            echo "| --- | --- |"
+            echo "| \`:app\` (player + LSPosed Hook) | \`WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}.apk\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload APK
+      - name: Upload integrated application APK
         uses: actions/upload-artifact@v4
         with:
           name: WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}
-          path: release-artifacts/*.apk
+          path: release-artifacts/WANmusic-${{ steps.version.outputs.safe_version_name }}-${{ steps.version.outputs.version_code }}.apk
           if-no-files-found: error
           retention-days: 30
 

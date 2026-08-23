@@ -44,6 +44,7 @@ kotlin {
 }
 
 dependencies {
+    compileOnly("de.robv.android.xposed:api:82")
     implementation(libs.lyricon.provider)
     implementation(libs.lyriconlibmodel)
     implementation(platform(libs.androidx.compose.bom))
