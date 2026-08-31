@@ -274,6 +274,21 @@ fun PersonalizationSettingsScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
             )
             ListItem(
+                headlineContent = { Text(appText("跳动范围", "Jump range")) },
+                supportingContent = {
+                    Text("${(AlbumDotMatrixSettings.jumpRange * 100).toInt()}%")
+                },
+                leadingContent = { Icon(Icons.Default.GraphicEq, null) }
+            )
+            Slider(
+                value = AlbumDotMatrixSettings.jumpRange,
+                onValueChange = { AlbumDotMatrixSettings.setJumpRange(context, it) },
+                valueRange = 0f..1f,
+                enabled = AlbumDotMatrixSettings.enabled &&
+                    AlbumDotMatrixSettings.visualizerDepthEnabled,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)
+            )
+            ListItem(
                 headlineContent = { Text(appText("点阵形状", "Dot shape")) },
                 supportingContent = { Text(appText("修改专辑点阵的像素外观", "Change the pixel shape used by the album matrix")) }
             )

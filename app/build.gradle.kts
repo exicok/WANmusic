@@ -47,6 +47,7 @@ dependencies {
     compileOnly("de.robv.android.xposed:api:82")
     implementation(libs.lyricon.provider)
     implementation(libs.lyriconlibmodel)
+    implementation(libs.backdrop)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

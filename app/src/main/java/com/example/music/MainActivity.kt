@@ -92,6 +92,8 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import kotlinx.coroutines.delay
+
 import com.example.music.ui.theme.MusicTheme
 import com.example.music.lyrics.EmbeddedLyricsReader
 import com.google.common.util.concurrent.MoreExecutors
@@ -99,6 +101,13 @@ import io.github.proify.lyricon.provider.LyriconFactory
 import io.github.proify.lyricon.lyric.model.Song as LyriconSong
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.LyricWord
+import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.effects.blur as backdropBlur
+import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.effects.vibrancy
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -733,7 +742,7 @@ fun MusicApp(
             }
         }
     }
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
     LaunchedEffect(currentScreen, playerLandscape) {
         activity?.requestedOrientation = when {
             currentScreen != Screen.PlayerView -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -1003,7 +1012,7 @@ fun MusicApp(
     var predictiveBackProgress by remember { mutableFloatStateOf(0f) }
     var predictiveBackDirection by remember { mutableFloatStateOf(1f) }
     // 音乐库根页面由系统执行返回桌面动画，其余页面统一使用预见式返回。
-    PredictiveBackHandler(enabled = currentScreen != Screen.LocalMusic) { progress ->
+    PredictiveBackHandler(enabled = currentScreen != Screen.Home) { progress ->
         try {
             progress.collect { backEvent ->
                 predictiveBackProgress = backEvent.progress.coerceIn(0f, 1f)
@@ -1024,8 +1033,6 @@ fun MusicApp(
         }
     }
     val floatingDockArtwork = currentSong?.let { rememberArtwork(it) }
-    var floatingDockDragProgress by remember { mutableFloatStateOf(0f) }
-    var floatingDockDragging by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1042,7 +1049,9 @@ fun MusicApp(
         val floatDockHasMiniPlayer = currentSong != null && currentScreen != Screen.PlayerView
         // 覆盖迷你播放器/导航栏、手势导航区及外边距，确保任何页面内容都位于 Dock 上方。
         val floatingDockSpace = 98.dp
+        val dockBackdrop = rememberLayerBackdrop()
         Scaffold(
+            modifier = Modifier.layerBackdrop(dockBackdrop),
             containerColor = if (currentScreen == Screen.PlayerView) Color.Transparent
                 else MaterialTheme.colorScheme.background,
             // 所有页面背景完整绘制到状态栏和导航栏后方；交互内容由各页面自行避让系统栏。
@@ -1098,6 +1107,11 @@ fun MusicApp(
                         LocalDockContentPadding provides if (floatOverlayActive) floatingDockSpace else 0.dp
                     ) {
                     when (screen) {
+                        Screen.Home -> HomeScreen(
+                            onOpenLibrary = { currentScreen = Screen.LocalMusic },
+                            songCount = songs.size,
+                            currentSong = currentSong
+                        )
                         Screen.PlayerView -> {
                             val song = currentSong
                             if (song != null) {
@@ -1256,8 +1270,7 @@ fun MusicApp(
         // 悬浮 Dock 在所有页面保持可见，页面继续绘制到窗口后方。
         if (floatOverlayActive) {
             FloatingDockWindow(
-                dragProgress = floatingDockDragProgress,
-                isDragging = floatingDockDragging,
+                backdrop = dockBackdrop,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
@@ -1273,6 +1286,7 @@ fun MusicApp(
                             onNext = { player.seekToNext() },
                             onPrevious = { player.seekToPrevious() },
                             onSeek = { player.seekTo((it * totalDuration).toLong()) },
+                            backdrop = dockBackdrop,
                             compactFloating = true
                         )
                     }
@@ -1283,17 +1297,61 @@ fun MusicApp(
                 MusicDock(
                     currentScreen = currentScreen,
                     onNavigate = { currentScreen = it },
-                    floating = true,
-                    onExpressiveDragChange = { progress, dragging ->
-                        floatingDockDragProgress = progress
-                        floatingDockDragging = dragging
-                    }
+                    backdrop = dockBackdrop,
+                    floating = true
                 )
             }
         }
     }
 }
 
+
+@Composable
+private fun HomeScreen(
+    onOpenLibrary: () -> Unit,
+    songCount: Int,
+    currentSong: Song?
+) {
+    val dockContentPadding = LocalDockContentPadding.current
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 28.dp)
+            .padding(bottom = dockContentPadding),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(appText("主页", "Home"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Card(
+            onClick = onOpenLibrary,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Icon(Icons.Default.LibraryMusic, null, Modifier.size(42.dp), MaterialTheme.colorScheme.primary)
+                Column(Modifier.weight(1f)) {
+                    Text(appText("音乐库", "Music library"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text(appText("${songCount} 首本地歌曲", "$songCount local songs"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Icon(Icons.AutoMirrored.Filled.ArrowForward, appText("打开音乐库", "Open library"))
+            }
+        }
+        currentSong?.let { song ->
+            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
+                Column(Modifier.padding(20.dp)) {
+                    Text(appText("正在播放", "Now playing"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                    Text(song.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(song.artist, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+}
 
 /**
  * 本地音乐独立页：完整显示所有本地音乐
@@ -1913,27 +1971,14 @@ private fun SongDetailRow(label: String, value: String) {
 
 @Composable
 private fun FloatingDockWindow(
-    dragProgress: Float,
-    isDragging: Boolean,
+    backdrop: Backdrop,
     modifier: Modifier = Modifier,
     miniPlayer: (@Composable () -> Unit)? = null,
     dock: @Composable () -> Unit
 ) {
-    val animationsEnabled = AppAnimationSettings.enabled
-    val expressiveProgress by animateFloatAsState(
-        targetValue = dragProgress.coerceIn(-1f, 1f),
-        animationSpec = if (isDragging || !animationsEnabled) {
-            snap()
-        } else {
-            spring(
-                dampingRatio = Spring.DampingRatioMediumBouncy,
-                stiffness = Spring.StiffnessMediumLow
-            )
-        },
-        label = "Md3ExpressiveDockDrag"
-    )
-    val dragEnergy = kotlin.math.abs(expressiveProgress)
-    val dockShape = RoundedCornerShape((32f + dragEnergy * 8f).dp)
+    val dockShape = RoundedCornerShape(32.dp)
+    val dockSurfaceColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val dockOutlineColor = MaterialTheme.colorScheme.outlineVariant
     val navigationBarHeight = WindowInsets.navigationBars
         .asPaddingValues()
         .calculateBottomPadding()
@@ -1951,28 +1996,34 @@ private fun FloatingDockWindow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Surface(
+            Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .graphicsLayer {
-                        val directionAnchor = if (expressiveProgress >= 0f) 0f else 1f
-                        transformOrigin = TransformOrigin(directionAnchor, 0.5f)
-                        translationX = expressiveProgress * size.width * 0.012f
-                        scaleX = 1f + dragEnergy * 0.025f
-                        scaleY = 1f - dragEnergy * 0.014f
-                    },
-                shape = dockShape,
-                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.58f),
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                tonalElevation = 6.dp,
-                shadowElevation = 12.dp,
-                border = BorderStroke(
-                    1.dp,
-                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)
-                )
+                    .drawBackdrop(
+                        backdrop = backdrop,
+                        shape = { dockShape },
+                        effects = {
+                            vibrancy()
+                            backdropBlur(8.dp.toPx())
+                            lens(18.dp.toPx(), 28.dp.toPx(), chromaticAberration = true)
+                        },
+                        onDrawSurface = {
+                            drawRect(
+                                color = dockSurfaceColor.copy(alpha = 0.34f)
+                            )
+                        }
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = dockOutlineColor.copy(alpha = 0.58f),
+                        shape = dockShape
+                    ),
+                contentAlignment = Alignment.Center
             ) {
-                dock()
+                CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurface) {
+                    dock()
+                }
             }
             if (miniPlayer != null) {
                 Box(
@@ -1989,7 +2040,8 @@ private fun FloatingDockWindow(
 }
 
 private fun dockRootScreen(screen: Screen): Screen = when (screen) {
-    Screen.LocalMusic -> Screen.LocalMusic
+    Screen.Home -> Screen.Home
+    Screen.LocalMusic -> Screen.Home
     Screen.PlayerView -> Screen.PlayerView
     Screen.Equalizer -> Screen.Equalizer
     else -> Screen.Settings
@@ -1999,15 +2051,13 @@ private fun dockRootScreen(screen: Screen): Screen = when (screen) {
 private fun MusicDock(
     currentScreen: Screen,
     onNavigate: (Screen) -> Unit,
-    floating: Boolean = false,
-    onExpressiveDragChange: (Float, Boolean) -> Unit = { _, _ -> }
+    backdrop: Backdrop? = null,
+    floating: Boolean = false
 ) {
     val dockScreens = remember {
-        listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
+        listOf(Screen.Home, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
     }
     val selectedScreen = dockRootScreen(currentScreen)
-    val dragThreshold = with(LocalDensity.current) { 48.dp.toPx() }
-    var dragOffset by remember { mutableFloatStateOf(0f) }
     val md3ItemColors = NavigationBarItemDefaults.colors(
         selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
         selectedTextColor = MaterialTheme.colorScheme.onSurface,
@@ -2016,50 +2066,10 @@ private fun MusicDock(
         unselectedTextColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f)
     )
     val dockModifier = Modifier
-        .graphicsLayer {
-            translationX = if (floating) 0f else dragOffset * 0.16f
-        }
-        .pointerInput(currentScreen, dragThreshold) {
-            detectHorizontalDragGestures(
-                onDragStart = {
-                    if (floating) onExpressiveDragChange(0f, true)
-                },
-                onDragCancel = {
-                    dragOffset = 0f
-                    if (floating) onExpressiveDragChange(0f, false)
-                },
-                onDragEnd = {
-                    val currentIndex = dockScreens.indexOf(selectedScreen)
-                    if (currentIndex >= 0 && kotlin.math.abs(dragOffset) >= dragThreshold) {
-                        val targetIndex = if (dragOffset < 0f) {
-                            (currentIndex + 1).coerceAtMost(dockScreens.lastIndex)
-                        } else {
-                            (currentIndex - 1).coerceAtLeast(0)
-                        }
-                        if (targetIndex != currentIndex) {
-                            onNavigate(dockScreens[targetIndex])
-                        }
-                    }
-                    dragOffset = 0f
-                    if (floating) onExpressiveDragChange(0f, false)
-                }
-            ) { change, dragAmount ->
-                change.consume()
-                val nextOffset = (dragOffset + dragAmount)
-                    .coerceIn(-dragThreshold * 1.5f, dragThreshold * 1.5f)
-                dragOffset = nextOffset
-                if (floating) {
-                    onExpressiveDragChange(
-                        (nextOffset / (dragThreshold * 1.5f)).coerceIn(-1f, 1f),
-                        true
-                    )
-                }
-            }
-        }
 
     if (floating) {
         val destinations = listOf(
-            Triple(Screen.LocalMusic, Icons.Default.LibraryMusic, appText("音乐", "Music")),
+            Triple(Screen.Home, Icons.Default.Home, appText("主页", "Home")),
             Triple(Screen.PlayerView, Icons.Default.PlayCircle, appText("播放", "Player")),
             Triple(Screen.Equalizer, Icons.Default.Equalizer, appText("均衡", "EQ")),
             Triple(Screen.Settings, Icons.Default.Settings, appText("设置", "Settings"))
@@ -2072,85 +2082,99 @@ private fun MusicDock(
         } else {
             snap<Float>()
         }
-        Row(
+        val selectedIndex = dockScreens.indexOf(selectedScreen).coerceAtLeast(0)
+        val settledDropPosition by animateFloatAsState(
+            targetValue = selectedIndex.toFloat(),
+            animationSpec = dockItemAnimation,
+            label = "FloatingDockDropPosition"
+        )
+        val dropPosition = settledDropPosition
+        val dropColor = MaterialTheme.colorScheme.secondaryContainer
+        val dropOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
+
+        BoxWithConstraints(
             modifier = dockModifier
                 .fillMaxWidth()
                 .height(62.dp)
-                .padding(6.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically
         ) {
-            destinations.forEach { (screen, icon, label) ->
-                val selected = selectedScreen == screen
-                val itemWeight by animateFloatAsState(
-                    targetValue = if (selected) 1.28f else 0.9f,
-                    animationSpec = dockItemAnimation,
-                    label = "FloatingDockWeight"
-                )
-                val itemProgress by animateFloatAsState(
-                    targetValue = if (selected) 1f else 0f,
-                    animationSpec = dockItemAnimation,
-                    label = "FloatingDockProgress"
-                )
-                Surface(
-                    onClick = { onNavigate(screen) },
+            val itemWidth = (maxWidth - 12.dp) / destinations.size
+            if (backdrop != null) {
+                Box(
                     modifier = Modifier
-                        .weight(itemWeight)
-                        .fillMaxHeight(),
-                    shape = RoundedCornerShape(28.dp),
-                    color = if (selected) {
-                        MaterialTheme.colorScheme.secondaryContainer
-                    } else {
-                        Color.Transparent
-                    },
-                    contentColor = if (selected) {
-                        MaterialTheme.colorScheme.onSecondaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    tonalElevation = if (selected) 2.dp else 0.dp
-                ) {
-                    AnimatedContent(
-                        targetState = selected,
-                        transitionSpec = {
-                            if (!AppAnimationSettings.enabled) {
-                                EnterTransition.None togetherWith ExitTransition.None
-                            } else {
-                                (fadeIn(tween(180)) + scaleIn(initialScale = 0.92f)) togetherWith
-                                    (fadeOut(tween(120)) + scaleOut(targetScale = 0.94f))
+                        .offset(x = 6.dp + itemWidth * dropPosition, y = 6.dp)
+                        .width(itemWidth)
+                        .height(50.dp)
+                        .drawBackdrop(
+                            backdrop = backdrop,
+                            shape = { RoundedCornerShape(25.dp) },
+                            effects = {
+                                vibrancy()
+                                backdropBlur(5.dp.toPx())
+                                lens(
+                                    refractionHeight = 12.dp.toPx(),
+                                    refractionAmount = 18.dp.toPx(),
+                                    depthEffect = true,
+                                    chromaticAberration = true
+                                )
+                            },
+                            onDrawSurface = {
+                                drawRect(dropColor.copy(alpha = 0.30f))
                             }
-                        },
-                        label = "FloatingDockItem"
-                    ) { isSelected ->
-                        Box(contentAlignment = Alignment.Center) {
-                            if (isSelected) {
-                                Row(
-                                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = icon,
-                                        contentDescription = label,
-                                        modifier = Modifier
-                                            .size(20.dp)
-                                            .graphicsLayer {
-                                                scaleX = 0.92f + itemProgress * 0.12f
-                                                scaleY = 0.92f + itemProgress * 0.12f
-                                            }
-                                    )
-                                    Text(
-                                        text = label,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1
-                                    )
+                        )
+                        .border(1.dp, dropOutline, RoundedCornerShape(25.dp))
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                destinations.forEach { (screen, icon, label) ->
+                    val selected = selectedScreen == screen
+                    val itemProgress by animateFloatAsState(
+                        targetValue = if (selected) 1f else 0f,
+                        animationSpec = dockItemAnimation,
+                        label = "FloatingDockProgress"
+                    )
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable { onNavigate(screen) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AnimatedContent(
+                            targetState = selected,
+                            transitionSpec = {
+                                if (!AppAnimationSettings.enabled) {
+                                    EnterTransition.None togetherWith ExitTransition.None
+                                } else {
+                                    (fadeIn(tween(180)) + scaleIn(initialScale = 0.92f)) togetherWith
+                                        (fadeOut(tween(120)) + scaleOut(targetScale = 0.94f))
                                 }
+                            },
+                            label = "FloatingDockItem"
+                        ) { isSelected ->
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = label,
+                                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier
+                                        .size(23.dp)
+                                        .graphicsLayer {
+                                            scaleX = 0.92f + itemProgress * 0.12f
+                                            scaleY = 0.92f + itemProgress * 0.12f
+                                        }
+                                )
                             } else {
-                                Text(
-                                    text = label,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = label,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(21.dp)
                                 )
                             }
                         }
@@ -2168,17 +2192,17 @@ private fun MusicDock(
         windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
     ) {
         NavigationBarItem(
-            selected = selectedScreen == Screen.LocalMusic,
-            onClick = { onNavigate(Screen.LocalMusic) },
+            selected = selectedScreen == Screen.Home,
+            onClick = { onNavigate(Screen.Home) },
             icon = {
                 val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
+                    targetValue = if (selectedScreen == Screen.Home) 1f else 0f,
                     animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
                     label = "DockLibraryIcon"
                 )
                 Icon(
-                    Icons.Default.LibraryMusic,
-                    appText("音乐", "Music"),
+                    Icons.Default.Home,
+                    appText("主页", "Home"),
                     modifier = Modifier.graphicsLayer {
                         scaleX = 0.9f + progress * 0.16f
                         scaleY = 0.9f + progress * 0.16f
@@ -2188,12 +2212,12 @@ private fun MusicDock(
             },
             label = {
                 val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
+                    targetValue = if (selectedScreen == Screen.Home) 1f else 0f,
                     animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
                     label = "DockLibraryLabel"
                 )
                 Text(
-                    appText("音乐", "Music"),
+                    appText("主页", "Home"),
                     modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
                 )
             },
@@ -3087,24 +3111,38 @@ fun MD3MiniPlayer(
     onNext: () -> Unit,
     onPrevious: () -> Unit,
     onSeek: (Float) -> Unit,
+    backdrop: Backdrop? = null,
     compactFloating: Boolean = false
 ) {
     val artwork = rememberArtwork(song, maxPx = 128)
     var sliderPosition by remember(progress) { mutableFloatStateOf(progress) }
 
     if (compactFloating) {
-        Surface(
-            shape = RoundedCornerShape(32.dp),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.58f),
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            tonalElevation = 6.dp,
-            shadowElevation = 12.dp,
-            border = BorderStroke(
-                1.dp,
-                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)
-            ),
-            modifier = Modifier
+        val glassShape = RoundedCornerShape(32.dp)
+        val glassSurface = MaterialTheme.colorScheme.surfaceContainerHigh
+        val glassOutline = MaterialTheme.colorScheme.outlineVariant
+        val controlTint = MaterialTheme.colorScheme.primaryContainer
+        val controlOutline = MaterialTheme.colorScheme.primary.copy(alpha = 0.30f)
+        val glassModifier = if (backdrop != null) {
+            Modifier.drawBackdrop(
+                backdrop = backdrop,
+                shape = { glassShape },
+                effects = {
+                    vibrancy()
+                    backdropBlur(8.dp.toPx())
+                    lens(18.dp.toPx(), 28.dp.toPx(), chromaticAberration = true)
+                },
+                onDrawSurface = {
+                    drawRect(glassSurface.copy(alpha = 0.34f))
+                }
+            )
+        } else {
+            Modifier.background(glassSurface.copy(alpha = 0.58f), glassShape)
+        }
+        Box(
+            modifier = glassModifier
                 .fillMaxSize()
+                .border(1.dp, glassOutline.copy(alpha = 0.58f), glassShape)
                 .clickable { onClick() }
         ) {
             Box {
@@ -3140,18 +3178,39 @@ fun MD3MiniPlayer(
                             }
                         }
                     }
-                    FilledIconButton(
-                        onClick = onTogglePlay,
-                        modifier = Modifier.size(38.dp),
-                        colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer,
-                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    val controlModifier = if (backdrop != null) {
+                        Modifier.drawBackdrop(
+                            backdrop = backdrop,
+                            shape = { CircleShape },
+                            effects = {
+                                vibrancy()
+                                backdropBlur(4.dp.toPx())
+                                lens(
+                                    refractionHeight = 9.dp.toPx(),
+                                    refractionAmount = 15.dp.toPx(),
+                                    depthEffect = true,
+                                    chromaticAberration = true
+                                )
+                            },
+                            onDrawSurface = {
+                                drawCircle(controlTint.copy(alpha = 0.46f))
+                            }
                         )
+                    } else {
+                        Modifier.background(controlTint, CircleShape)
+                    }
+                    Box(
+                        modifier = controlModifier
+                            .size(38.dp)
+                            .border(1.dp, controlOutline, CircleShape)
+                            .clickable { onTogglePlay() },
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                             contentDescription = if (isPlaying) appText("暂停", "Pause") else appText("播放", "Play"),
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier.size(24.dp),
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                     }
                 }
@@ -3594,11 +3653,21 @@ fun FullPlayerScreen(
     LaunchedEffect(song.uri, isPlaying) {
         spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
     }
-    val beatEnergy = rememberBeatEnergy(
-        isPlaying = isPlaying,
-        enabled = (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled) &&
-            animationsEnabled
+    val fileSpectrumEnabled = isPlaying && animationsEnabled &&
+        (spectrumProgressEnabled ||
+            (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled))
+    val fileSpectrum = rememberAudioFileSpectrum(
+        context = context,
+        uri = song.uri,
+        positionMs = position,
+        enabled = fileSpectrumEnabled,
+        bandCount = 80
     )
+    val beatEnergy = if (AlbumDotMatrixSettings.enabled && fileSpectrum.isNotEmpty()) {
+        fileSpectrum.take(8).average().toFloat().coerceIn(0f, 1f)
+    } else {
+        0f
+    }
     val beatScale by animateFloatAsState(
         targetValue = beatScaleFromEnergy(beatEnergy),
         animationSpec = tween(durationMillis = if (animationsEnabled) 100 else 0),
@@ -3749,6 +3818,7 @@ fun FullPlayerScreen(
                             },
                             isPlaying = isPlaying,
                             spectrumEnabled = spectrumProgressEnabled,
+                            spectrumBars = fileSpectrum,
                             colors = SliderDefaults.colors(
                                 thumbColor = MaterialTheme.colorScheme.onSurface,
                                 activeTrackColor = MaterialTheme.colorScheme.onSurface
@@ -4003,6 +4073,7 @@ fun FullPlayerScreen(
                     },
                     isPlaying = isPlaying,
                     spectrumEnabled = spectrumProgressEnabled,
+                    spectrumBars = fileSpectrum,
                     colors = SliderDefaults.colors(
                         thumbColor = MaterialTheme.colorScheme.primary,
                         activeTrackColor = MaterialTheme.colorScheme.primary

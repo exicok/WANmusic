@@ -1,6 +1,5 @@
 package com.example.music
 
-import android.os.SystemClock
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,42 +26,43 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
-import kotlin.math.cos
 import kotlin.math.max
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
  * 频谱条数据 0f..1f。
- * 优先共享 Visualizer FFT；失败时在播放中合成动态频谱。
+ * 仅使用共享 Visualizer FFT；没有真实音频数据时保持静止。
  */
 @Composable
 fun rememberSpectrumBars(
     isPlaying: Boolean,
     enabled: Boolean,
-    barCount: Int = 48
+    barCount: Int = 48,
+    audioSessionIdProvider: () -> Int = { AudioSessionHolder.sessionId }
 ): FloatArray {
     val effectiveEnabled = enabled && AppAnimationSettings.enabled
     var bars by remember(barCount) { mutableStateOf(FloatArray(barCount)) }
-    var sessionId by remember { mutableIntStateOf(AudioSessionHolder.sessionId) }
-    var useVisualizer by remember { mutableStateOf(false) }
+    var sessionId by remember { mutableIntStateOf(audioSessionIdProvider()) }
     val smoothed = remember(barCount) { FloatArray(barCount) }
 
     LaunchedEffect(isPlaying, effectiveEnabled) {
         while (effectiveEnabled) {
-            val id = AudioSessionHolder.sessionId
+            val id = audioSessionIdProvider()
             if (id != sessionId) {
                 sessionId = id
                 SharedAudioVisualizer.onSessionChanged(id)
             }
-            delay(400)
+            if (!isPlaying || sessionId <= 0) {
+                bars = FloatArray(barCount)
+                smoothed.fill(0f)
+            }
+            delay(250L)
         }
     }
 
     DisposableEffect(effectiveEnabled, barCount) {
         if (!effectiveEnabled) {
             bars = FloatArray(barCount)
-            useVisualizer = false
             onDispose { }
         } else {
             val listener: (ByteArray) -> Unit = listener@{ fft ->
@@ -79,58 +79,14 @@ fun rememberSpectrumBars(
                     }
                 }
                 bars = out
-                useVisualizer = true
             }
             SharedAudioVisualizer.addListener(listener)
-            SharedAudioVisualizer.onSessionChanged(AudioSessionHolder.sessionId)
-            useVisualizer = SharedAudioVisualizer.isAttached
+            SharedAudioVisualizer.onSessionChanged(audioSessionIdProvider())
             onDispose {
                 SharedAudioVisualizer.removeListener(listener)
-                if (!effectiveEnabled) bars = FloatArray(barCount)
+                bars = FloatArray(barCount)
+                smoothed.fill(0f)
             }
-        }
-    }
-
-    // 合成频谱兜底
-    LaunchedEffect(isPlaying, effectiveEnabled, useVisualizer, sessionId, barCount) {
-        if (!effectiveEnabled) {
-            bars = FloatArray(barCount)
-            return@LaunchedEffect
-        }
-        while (true) {
-            if (!isPlaying) {
-                val decayed = FloatArray(barCount) { i ->
-                    (bars.getOrElse(i) { 0f } * 0.88f).let { if (it < 0.02f) 0f else it }
-                }
-                bars = decayed
-                delay(32)
-                continue
-            }
-            // 已有真实频谱时只做轻量保活，避免双轨抢写
-            if (useVisualizer && SharedAudioVisualizer.isAttached && sessionId > 0) {
-                delay(80)
-                // 若长时间无回调，回退合成
-                continue
-            }
-            val now = SystemClock.uptimeMillis()
-            val next = FloatArray(barCount) { i ->
-                val t = now / 1000f
-                val phase = i * 0.35f
-                val wave = (
-                    0.45f + 0.35f * sin(t * 3.1f + phase) +
-                        0.20f * cos(t * 5.4f + phase * 1.7f) +
-                        0.15f * sin(t * 1.2f + i * 0.08f)
-                    ).coerceIn(0f, 1f)
-                val bassBoost = 1f - (i.toFloat() / barCount) * 0.45f
-                (wave * bassBoost).coerceIn(0f, 1f)
-            }
-            val blended = FloatArray(barCount) { i ->
-                val prev = bars.getOrElse(i) { 0f }
-                val raw = next[i]
-                if (raw > prev) prev * 0.3f + raw * 0.7f else prev * 0.75f + raw * 0.25f
-            }
-            bars = blended
-            delay(16L)
         }
     }
 
@@ -177,14 +133,18 @@ fun SpectrumProgressSlider(
     onValueChangeFinished: (() -> Unit)? = null,
     isPlaying: Boolean,
     spectrumEnabled: Boolean,
+    spectrumBars: FloatArray? = null,
+    audioSessionIdProvider: () -> Int = { AudioSessionHolder.sessionId },
     modifier: Modifier = Modifier,
     colors: SliderColors = SliderDefaults.colors()
 ) {
-    val bars = rememberSpectrumBars(
+    val liveBars = rememberSpectrumBars(
         isPlaying = isPlaying,
-        enabled = spectrumEnabled,
-        barCount = 52
+        enabled = spectrumEnabled && spectrumBars == null,
+        barCount = 52,
+        audioSessionIdProvider = audioSessionIdProvider
     )
+    val bars = spectrumBars ?: liveBars
     val primary = MaterialTheme.colorScheme.primary
     val secondary = MaterialTheme.colorScheme.secondary
     val onSurface = MaterialTheme.colorScheme.onSurface

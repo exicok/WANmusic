@@ -58,6 +58,8 @@ object AlbumDotMatrixSettings {
         private set
     var visualizerDepthEnabled by mutableStateOf(true)
         private set
+    var jumpRange by mutableFloatStateOf(0.5f)
+        private set
     var manualYaw by mutableFloatStateOf(10f)
         private set
     var manualPitch by mutableFloatStateOf(12f)
@@ -75,6 +77,7 @@ object AlbumDotMatrixSettings {
         rotationSpeed = prefs.getFloat("album_dot_matrix_rotation_speed", 0.45f).coerceIn(0.1f, 1.5f)
         depth = prefs.getFloat("album_dot_matrix_depth", 0.55f).coerceIn(0f, 1f)
         visualizerDepthEnabled = prefs.getBoolean("album_dot_matrix_visualizer_depth", true)
+        jumpRange = prefs.getFloat("album_dot_matrix_jump_range", 0.5f).coerceIn(0f, 1f)
         manualYaw = prefs.getFloat("album_dot_matrix_manual_yaw", 10f)
         manualPitch = prefs.getFloat("album_dot_matrix_manual_pitch", 12f).coerceIn(-62f, 62f)
     }
@@ -120,6 +123,13 @@ object AlbumDotMatrixSettings {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit { putBoolean("album_dot_matrix_visualizer_depth", value) }
     }
 
+    fun setJumpRange(context: Context, value: Float) {
+        jumpRange = value.coerceIn(0f, 1f)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
+            putFloat("album_dot_matrix_jump_range", jumpRange)
+        }
+    }
+
     fun setDotShape(context: Context, value: String) {
         dotShape = value.takeIf { it in setOf("circle", "square", "diamond") } ?: "circle"
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
@@ -162,6 +172,7 @@ fun DotMatrixArtwork(
     )
     val autoYaw = if (AlbumDotMatrixSettings.rotationEnabled) rotationPhase else 0f
     val depthAmount = AlbumDotMatrixSettings.depth
+    val jumpRange = AlbumDotMatrixSettings.jumpRange
     val energy = if (AlbumDotMatrixSettings.visualizerDepthEnabled) visualizerEnergy.coerceIn(0f, 1f) else 0f
 
     Canvas(
@@ -184,6 +195,7 @@ fun DotMatrixArtwork(
             rotationDegrees = autoYaw + manualYaw,
             tiltDegrees = manualPitch,
             depthAmount = depthAmount,
+            jumpRange = jumpRange,
             energy = energy
         )
     }
@@ -229,6 +241,7 @@ private fun DrawScope.drawRandomArtworkDots(
     rotationDegrees: Float,
     tiltDegrees: Float,
     depthAmount: Float,
+    jumpRange: Float,
     energy: Float
 ) {
     val radius = size.minDimension / requestedColumns.coerceAtLeast(1) * requestedDotScale * 0.5f
@@ -239,7 +252,7 @@ private fun DrawScope.drawRandomArtworkDots(
         val nx = dot.x
         val ny = dot.y
         val beatJump = sin(dot.jumpPhase + energy * PI.toFloat()) * energy
-        val sourceZ = dot.baseDepth * depthAmount + beatJump * depthAmount * 0.46f
+        val sourceZ = dot.baseDepth * depthAmount + beatJump * jumpRange
         val rotatedX = nx * cos(rotationRadians) + sourceZ * sin(rotationRadians)
         val rotatedZ = -nx * sin(rotationRadians) + sourceZ * cos(rotationRadians)
         val tiltedY = ny * cos(tiltRadians) - rotatedZ * sin(tiltRadians)

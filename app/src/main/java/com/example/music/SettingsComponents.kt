@@ -40,20 +40,26 @@ fun SettingsItem(label: String, icon: ImageVector, detail: String? = null, onCli
                 )
             }
         }
-        ListItem(
-            headlineContent = { Text(label) },
-            leadingContent = {
-                Icon(
-                    icon,
-                    null,
-                    modifier = Modifier.clickable { expanded = !expanded }
-                )
-            },
-            trailingContent = {
-                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
-            },
-            modifier = Modifier.clickable(onClick = onClick)
-        )
+        Card(
+            modifier = Modifier
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .fillMaxWidth()
+        ) {
+            ListItem(
+                headlineContent = { Text(label) },
+                leadingContent = {
+                    Icon(
+                        icon,
+                        null,
+                        modifier = Modifier.clickable { expanded = !expanded }
+                    )
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
+                },
+                modifier = Modifier.clickable(onClick = onClick)
+            )
+        }
     }
 }
 

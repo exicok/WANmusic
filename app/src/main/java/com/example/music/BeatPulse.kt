@@ -23,26 +23,27 @@ object AudioSessionHolder {
 @Composable
 fun rememberBeatEnergy(
     isPlaying: Boolean,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    audioSessionIdProvider: () -> Int = { AudioSessionHolder.sessionId }
 ): Float {
     val effectiveEnabled = enabled && AppAnimationSettings.enabled
     var energy by remember { mutableFloatStateOf(0f) }
-    var sessionId by remember { mutableIntStateOf(AudioSessionHolder.sessionId) }
+    var sessionId by remember { mutableIntStateOf(audioSessionIdProvider()) }
     var smoothed by remember { mutableFloatStateOf(0f) }
 
     // 轮询会话 ID（播放服务异步挂载）
     LaunchedEffect(isPlaying, effectiveEnabled) {
         while (effectiveEnabled) {
-            val id = AudioSessionHolder.sessionId
+            val id = audioSessionIdProvider()
             if (id != sessionId) {
                 sessionId = id
                 SharedAudioVisualizer.onSessionChanged(id)
-                if (id <= 0) {
-                    energy = 0f
-                    smoothed = 0f
-                }
             }
-            delay(400)
+            if (!isPlaying || id <= 0) {
+                energy = 0f
+                smoothed = 0f
+            }
+            delay(250)
         }
     }
 
@@ -61,27 +62,12 @@ fun rememberBeatEnergy(
                 energy = smoothed.coerceIn(0f, 1f)
             }
             SharedAudioVisualizer.addListener(listener)
-            SharedAudioVisualizer.onSessionChanged(AudioSessionHolder.sessionId)
+            SharedAudioVisualizer.onSessionChanged(audioSessionIdProvider())
             onDispose {
                 SharedAudioVisualizer.removeListener(listener)
                 energy = 0f
                 smoothed = 0f
             }
-        }
-    }
-
-    // 没有真实音频数据时保持静止；不再使用合成兜底。
-    LaunchedEffect(isPlaying, effectiveEnabled, sessionId) {
-        if (!effectiveEnabled) {
-            energy = 0f
-            return@LaunchedEffect
-        }
-        while (true) {
-            if (!isPlaying || sessionId <= 0 || !SharedAudioVisualizer.isAttached) {
-                energy = 0f
-                smoothed = 0f
-            }
-            delay(80L)
         }
     }
 
