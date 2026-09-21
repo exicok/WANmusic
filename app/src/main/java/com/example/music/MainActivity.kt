@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.util.LruCache
+import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
@@ -61,6 +62,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
@@ -87,9 +89,11 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.delay
@@ -173,6 +177,7 @@ object ScanRecordsManager {
     private const val KEY_DURATION = "d"   // Song 类的第三个字段实际存的是文件大小
     private const val KEY_URI = "u"
     private const val KEY_ARTWORK = "w"   // 封面文件 hash（用 URI 哈希做文件名）
+    private const val KEY_VIDEO = "mv"
     private const val DEFAULT_ARTWORK_SIZE = 768
     private val artworkSizeBuckets = intArrayOf(96, 160, 320, DEFAULT_ARTWORK_SIZE)
     private val missingArtwork = ConcurrentHashMap.newKeySet<String>()
@@ -196,6 +201,7 @@ object ScanRecordsManager {
                 obj.put(KEY_ARTIST, s.artist)
                 obj.put(KEY_DURATION, s.duration)
                 obj.put(KEY_URI, s.uri.toString())
+                s.videoUri?.let { obj.put(KEY_VIDEO, it.toString()) }
                 val hash = s.uri.toString().hashCode().toString(16)
                 val artworkFile = File(artworkDir, "$hash.png")
                 if (artworkFile.exists()) {
@@ -239,7 +245,8 @@ object ScanRecordsManager {
                             artist = obj.optString(KEY_ARTIST, "本地音频"),
                             duration = obj.optString(KEY_DURATION, ""),
                             uri = obj.optString(KEY_URI).toUri(),
-                            artwork = null  // 不在加载时解码，避免卡死
+                            artwork = null,  // 不在加载时解码，避免卡死
+                            videoUri = obj.optString(KEY_VIDEO).takeIf { it.isNotEmpty() }?.toUri()
                         )
                     )
                 }
@@ -679,7 +686,8 @@ data class Song(
     val artist: String, 
     val duration: String, 
     val uri: Uri,
-    val artwork: Bitmap? = null
+    val artwork: Bitmap? = null,
+    val videoUri: Uri? = null
 )
 
 @Composable
@@ -742,7 +750,7 @@ fun MusicApp(
             }
         }
     }
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.LocalMusic) }
     LaunchedEffect(currentScreen, playerLandscape) {
         activity?.requestedOrientation = when {
             currentScreen != Screen.PlayerView -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -813,8 +821,36 @@ fun MusicApp(
                     musicDirectories.forEach { uri ->
                         val root = DocumentFile.fromTreeUri(context, uri)
                         if (root != null && root.isDirectory) {
-                            root.listFiles().forEach { file ->
-                                if (file.isFile && isMusicFile(file.name)) {
+                            val children = root.listFiles()
+                            // 同名 MV 与音乐合并为同一条目（不单独入库）
+                            val videosByBaseName = children
+                                .filter { it.isFile && isVideoFile(it.name) }
+                                .associateBy(
+                                    { it.name?.substringBeforeLast('.')?.trim()?.lowercase().orEmpty() }
+                                ) { it.uri }
+                            // 同名多个音频文件合并为一个条目：无损优先，其次大文件
+                            fun qualityRank(name: String?): Int = when (
+                                name?.substringAfterLast('.', "")?.lowercase()
+                            ) {
+                                "flac", "wav", "ape", "dsf", "dff" -> 2
+                                else -> 1
+                            }
+                            children
+                                .filter { it.isFile && isMusicFile(it.name) }
+                                .groupBy {
+                                    it.name?.substringBeforeLast('.')?.trim()?.lowercase().orEmpty()
+                                }
+                                .values
+                                .mapNotNull { group ->
+                                    group.maxWithOrNull(
+                                        compareBy({ qualityRank(it.name) }, { it.length() ?: 0L })
+                                    )
+                                }
+                                .forEach { file ->
+                                    val mvUri = file.name
+                                        ?.substringBeforeLast('.')
+                                        ?.trim()?.lowercase()
+                                        ?.let { videosByBaseName[it] }
                                     try {
                                         retriever.setDataSource(context, file.uri)
                                         val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE) ?: file.name ?: "Unknown"
@@ -823,12 +859,11 @@ fun MusicApp(
                                         if (artBytes != null) {
                                             ScanRecordsManager.cacheEmbeddedArtwork(context, file.uri, artBytes)
                                         }
-                                        foundSongs.add(Song(title, artist, formatFileSize(file.length()), file.uri))
+                                        foundSongs.add(Song(title, artist, formatFileSize(file.length()), file.uri, videoUri = mvUri))
                                     } catch (_: Exception) {
-                                        foundSongs.add(Song(file.name ?: "Unknown", "本地音频", formatFileSize(file.length()), file.uri))
+                                        foundSongs.add(Song(file.name ?: "Unknown", "本地音频", formatFileSize(file.length()), file.uri, videoUri = mvUri))
                                     }
                                 }
-                            }
                         }
                     }
                     retriever.release()
@@ -871,10 +906,54 @@ fun MusicApp(
         }
     }
 
+    // MV 模式提升到主界面：切换到其他页面时 MV 继续播放（音频+进度不断）
+    var mvVideoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
+    // 按曲目记忆音乐/MV 模式；mvModeEnabled 直接由当前曲目推导（无异步竞态，切页不会被重置）
+    val mvModeBySong = remember { mutableStateMapOf<String, Boolean>() }
+    val mvModeEnabled = currentSong?.let { song ->
+        song.videoUri != null && mvModeBySong[song.uri.toString()] == true
+    } == true
+    // MV 模式全程静音主播放器（音乐只是后台时钟），退出 MV 模式后恢复外放
+    LaunchedEffect(mvModeEnabled) {
+        runCatching { (player as? MediaController)?.setVolume(if (mvModeEnabled) 0f else 1f) }
+    }
+    LaunchedEffect(mvModeEnabled, currentSong?.videoUri) {
+        val uri = if (mvModeEnabled) currentSong?.videoUri else null
+        val existing = mvVideoPlayer
+        if (uri == null) {
+            runCatching { existing?.release() }
+            mvVideoPlayer = null
+        } else if (existing == null || existing.currentMediaItem?.localConfiguration?.uri != uri) {
+            runCatching { existing?.release() }
+            // 不用 apply 块：外层 repeatMode/isPlaying 状态与播放器属性同名，直接显式赋值
+            val built = ExoPlayer.Builder(context).build()
+            // 不申请音频焦点，否则会打断服务侧主播放器导致 MV 没声音没画面
+            built.setAudioAttributes(AudioAttributes.DEFAULT, false)
+            built.setMediaItem(MediaItem.fromUri(uri))
+            built.volume = 1f
+            built.repeatMode = Player.REPEAT_MODE_ONE
+            built.seekTo(player.currentPosition.coerceAtLeast(0L))
+            built.playWhenReady = player.isPlaying
+            built.prepare()
+            mvVideoPlayer = built
+        }
+    }
+    LaunchedEffect(isPlaying, mvVideoPlayer) {
+        mvVideoPlayer?.playWhenReady = isPlaying
+    }
+    LaunchedEffect(currentPosition) {
+        val videoPlayer = mvVideoPlayer ?: return@LaunchedEffect
+        // MV 进度为准：静音的主播放器偏差过大时追赶到视频位置
+        if (kotlin.math.abs(player.currentPosition - videoPlayer.currentPosition) > 800) {
+            runCatching { player.seekTo(videoPlayer.currentPosition.coerceAtLeast(0L)) }
+        }
+    }
+
     // 发送完整的结构化逐字歌词；Lyricon 会根据 LyricWord 的 begin/end 自动渲染逐字进度。
-    LaunchedEffect(currentSong, currentSongLyrics, totalDuration) {
+    // MV 模式下不向歌词模块发送数据。
+    LaunchedEffect(currentSong, currentSongLyrics, totalDuration, mvModeEnabled) {
         val song = currentSong
-        if (song == null) {
+        if (song == null || mvModeEnabled) {
             lyriconProvider?.player?.setSong(null)
         } else {
             lyriconProvider?.player?.setSong(
@@ -896,12 +975,12 @@ fun MusicApp(
         lyriconProvider?.player?.setPosition(currentPosition.coerceAtLeast(0L))
     }
 
-    // 同步给桌面歌词部件与悬浮歌词
-    LaunchedEffect(currentSong, currentSongLyrics, currentPosition, totalDuration, isPlaying) {
+    // 同步给桌面歌词部件与悬浮歌词；MV 模式下不发送歌词数据
+    LaunchedEffect(currentSong, currentSongLyrics, currentPosition, totalDuration, isPlaying, mvModeEnabled) {
         LyricsStateHolder.publish(
             context = context,
             song = currentSong,
-            lyrics = currentSongLyrics,
+            lyrics = if (mvModeEnabled) emptyList() else currentSongLyrics,
             position = currentPosition,
             duration = totalDuration,
             playing = isPlaying
@@ -937,11 +1016,18 @@ fun MusicApp(
         OverlayLyricsService.startIfEnabled(context)
     }
 
-    LaunchedEffect(isPlaying, currentSong) {
+    LaunchedEffect(isPlaying, currentSong, mvModeEnabled, mvVideoPlayer) {
         if (isPlaying) {
             while (true) {
-                currentPosition = player.currentPosition
-                totalDuration = player.duration.coerceAtLeast(0L)
+                val videoClock = if (mvModeEnabled) mvVideoPlayer else null
+                if (videoClock != null) {
+                    // MV 模式进度以视频为准
+                    currentPosition = videoClock.currentPosition.coerceAtLeast(0L)
+                    totalDuration = videoClock.duration.coerceAtLeast(0L)
+                } else {
+                    currentPosition = player.currentPosition
+                    totalDuration = player.duration.coerceAtLeast(0L)
+                }
                 // 播放时也记录进度
                 LastPlaybackManager.save(context, currentSong?.uri, currentPosition, totalDuration)
                 delay(100.milliseconds)
@@ -1012,7 +1098,7 @@ fun MusicApp(
     var predictiveBackProgress by remember { mutableFloatStateOf(0f) }
     var predictiveBackDirection by remember { mutableFloatStateOf(1f) }
     // 音乐库根页面由系统执行返回桌面动画，其余页面统一使用预见式返回。
-    PredictiveBackHandler(enabled = currentScreen != Screen.Home) { progress ->
+    PredictiveBackHandler(enabled = currentScreen != Screen.LocalMusic) { progress ->
         try {
             progress.collect { backEvent ->
                 predictiveBackProgress = backEvent.progress.coerceIn(0f, 1f)
@@ -1078,6 +1164,33 @@ fun MusicApp(
                     transitionSpec = {
                         if (!AppAnimationSettings.enabled) {
                             EnterTransition.None togetherWith ExitTransition.None
+                        } else if (targetState == Screen.PlayerView) {
+                            // 进入播放页：从 Dock 位置向上滑动展开
+                            (
+                                slideInVertically(
+                                    animationSpec = tween(durationMillis = 380),
+                                    initialOffsetY = { fullHeight -> fullHeight }
+                                ) + fadeIn(animationSpec = tween(200), initialAlpha = 0.35f)
+                            ) togetherWith (
+                                fadeOut(animationSpec = tween(160)) + scaleOut(
+                                    targetScale = 0.94f,
+                                    transformOrigin = TransformOrigin(0.5f, 1f),
+                                    animationSpec = tween(durationMillis = 380)
+                                )
+                            )
+                        } else if (initialState == Screen.PlayerView) {
+                            // 切离播放页：播放器向下滑回 Dock 位置
+                            (
+                                fadeIn(animationSpec = tween(220), initialAlpha = 0.35f) + slideInVertically(
+                                    animationSpec = tween(durationMillis = 380),
+                                    initialOffsetY = { fullHeight -> (fullHeight * 0.08f).toInt() }
+                                )
+                            ) togetherWith (
+                                slideOutVertically(
+                                    animationSpec = tween(durationMillis = 380),
+                                    targetOffsetY = { fullHeight -> fullHeight }
+                                ) + fadeOut(animationSpec = tween(200))
+                            )
                         } else {
                             val duration = 320
                             (
@@ -1107,11 +1220,6 @@ fun MusicApp(
                         LocalDockContentPadding provides if (floatOverlayActive) floatingDockSpace else 0.dp
                     ) {
                     when (screen) {
-                        Screen.Home -> HomeScreen(
-                            onOpenLibrary = { currentScreen = Screen.LocalMusic },
-                            songCount = songs.size,
-                            currentSong = currentSong
-                        )
                         Screen.PlayerView -> {
                             val song = currentSong
                             if (song != null) {
@@ -1123,6 +1231,7 @@ fun MusicApp(
                                     duration = totalDuration,
                                     onTogglePlay = { if (player.isPlaying) player.pause() else player.play() },
                                     onSeek = {
+                                        if (mvModeEnabled) runCatching { mvVideoPlayer?.seekTo(it) }
                                         player.seekTo(it)
                                         currentPosition = it
                                         lyriconProvider?.player?.seekTo(it)
@@ -1164,7 +1273,12 @@ fun MusicApp(
                                     onBack = handleBack,
                                     isLandscape = playerLandscape,
                                     floatingDockVisible = floatOverlayActive,
-                                    fixedDockBottomPadding = 0.dp
+                                    fixedDockBottomPadding = 0.dp,
+                                    mvModeEnabled = mvModeEnabled,
+                                    onMvModeEnabledChange = { enabled ->
+                                        currentSong?.let { mvModeBySong[it.uri.toString()] = enabled }
+                                    },
+                                    mvVideoPlayer = mvVideoPlayer
                                 )
                             } else {
                                 Box(
@@ -1267,14 +1381,28 @@ fun MusicApp(
             }
         }
 
-        // 悬浮 Dock 在所有页面保持可见，页面继续绘制到窗口后方。
-        if (floatOverlayActive) {
+        // 悬浮 Dock 随页面切换滑动：普通页滑入展开，播放页滑出收起
+        AnimatedVisibility(
+            visible = floatOverlayActive,
+            enter = if (AppAnimationSettings.enabled) {
+                slideInVertically(tween(360)) { it } + fadeIn(tween(220))
+            } else {
+                EnterTransition.None
+            },
+            exit = if (AppAnimationSettings.enabled) {
+                slideOutVertically(tween(360)) { it } + fadeOut(tween(220))
+            } else {
+                ExitTransition.None
+            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .zIndex(10f),
+            label = "FloatingDockVisibility"
+        ) {
             FloatingDockWindow(
                 backdrop = dockBackdrop,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .zIndex(10f),
+                modifier = Modifier.fillMaxWidth(),
                 miniPlayer = if (floatDockHasMiniPlayer) {
                     {
                         MD3MiniPlayer(
@@ -1305,53 +1433,6 @@ fun MusicApp(
     }
 }
 
-
-@Composable
-private fun HomeScreen(
-    onOpenLibrary: () -> Unit,
-    songCount: Int,
-    currentSong: Song?
-) {
-    val dockContentPadding = LocalDockContentPadding.current
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .statusBarsPadding()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp, vertical = 28.dp)
-            .padding(bottom = dockContentPadding),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(appText("主页", "Home"), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        Card(
-            onClick = onOpenLibrary,
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp)
-        ) {
-            Row(
-                modifier = Modifier.padding(20.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                Icon(Icons.Default.LibraryMusic, null, Modifier.size(42.dp), MaterialTheme.colorScheme.primary)
-                Column(Modifier.weight(1f)) {
-                    Text(appText("音乐库", "Music library"), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text(appText("${songCount} 首本地歌曲", "$songCount local songs"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Icon(Icons.AutoMirrored.Filled.ArrowForward, appText("打开音乐库", "Open library"))
-            }
-        }
-        currentSong?.let { song ->
-            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
-                Column(Modifier.padding(20.dp)) {
-                    Text(appText("正在播放", "Now playing"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                    Text(song.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text(song.artist, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        }
-    }
-}
 
 /**
  * 本地音乐独立页：完整显示所有本地音乐
@@ -2039,9 +2120,72 @@ private fun FloatingDockWindow(
 
 }
 
+/**
+ * MV 视频画面：播放器由主界面持有（切换到其他页面时音频继续、进度不断），
+ * 这里只负责挂载/卸载渲染表面并保持原始比例。
+ */
+@Composable
+private fun MvVideoSurface(
+    videoPlayer: ExoPlayer,
+    videoUri: Uri,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current.applicationContext
+    val surfaceView = remember { SurfaceView(context) }
+    var videoAspectRatio by remember(videoUri) { mutableFloatStateOf(0f) }
+    LaunchedEffect(videoUri) {
+        videoAspectRatio = withContext(Dispatchers.IO) {
+            try {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(context, videoUri)
+                val width = retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                val height = retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                val rotation = retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                retriever.release()
+                if (width > 0 && height > 0) {
+                    if (rotation == 90 || rotation == 270) height.toFloat() / width
+                    else width.toFloat() / height
+                } else 0f
+            } catch (_: Exception) {
+                0f
+            }
+        }
+    }
+    DisposableEffect(videoPlayer, surfaceView) {
+        runCatching { videoPlayer.setVideoSurfaceView(surfaceView) }
+        onDispose { runCatching { videoPlayer.clearVideoSurfaceView(surfaceView) } }
+    }
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(
+            factory = { surfaceView },
+            modifier = if (videoAspectRatio > 0f) {
+                Modifier.aspectRatio(videoAspectRatio)
+            } else {
+                Modifier.fillMaxSize()
+            }
+        )
+    }
+}
+
+/** MV 画面（模式切换只通过头部按钮）。 */
+@Composable
+private fun MvVideoArea(
+    videoPlayer: ExoPlayer,
+    videoUri: Uri,
+    modifier: Modifier = Modifier
+) {
+    MvVideoSurface(
+        videoPlayer = videoPlayer,
+        videoUri = videoUri,
+        modifier = modifier
+    )
+}
+
 private fun dockRootScreen(screen: Screen): Screen = when (screen) {
-    Screen.Home -> Screen.Home
-    Screen.LocalMusic -> Screen.Home
+    Screen.LocalMusic -> Screen.LocalMusic
     Screen.PlayerView -> Screen.PlayerView
     Screen.Equalizer -> Screen.Equalizer
     else -> Screen.Settings
@@ -2055,7 +2199,7 @@ private fun MusicDock(
     floating: Boolean = false
 ) {
     val dockScreens = remember {
-        listOf(Screen.Home, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
+        listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
     }
     val selectedScreen = dockRootScreen(currentScreen)
     val md3ItemColors = NavigationBarItemDefaults.colors(
@@ -2069,7 +2213,7 @@ private fun MusicDock(
 
     if (floating) {
         val destinations = listOf(
-            Triple(Screen.Home, Icons.Default.Home, appText("主页", "Home")),
+            Triple(Screen.LocalMusic, Icons.Default.LibraryMusic, appText("音乐库", "Library")),
             Triple(Screen.PlayerView, Icons.Default.PlayCircle, appText("播放", "Player")),
             Triple(Screen.Equalizer, Icons.Default.Equalizer, appText("均衡", "EQ")),
             Triple(Screen.Settings, Icons.Default.Settings, appText("设置", "Settings"))
@@ -2192,17 +2336,17 @@ private fun MusicDock(
         windowInsets = if (floating) WindowInsets(0, 0, 0, 0) else NavigationBarDefaults.windowInsets
     ) {
         NavigationBarItem(
-            selected = selectedScreen == Screen.Home,
-            onClick = { onNavigate(Screen.Home) },
+            selected = selectedScreen == Screen.LocalMusic,
+            onClick = { onNavigate(Screen.LocalMusic) },
             icon = {
                 val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.Home) 1f else 0f,
+                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
                     animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
                     label = "DockLibraryIcon"
                 )
                 Icon(
-                    Icons.Default.Home,
-                    appText("主页", "Home"),
+                    Icons.Default.LibraryMusic,
+                    appText("音乐库", "Library"),
                     modifier = Modifier.graphicsLayer {
                         scaleX = 0.9f + progress * 0.16f
                         scaleY = 0.9f + progress * 0.16f
@@ -2212,12 +2356,12 @@ private fun MusicDock(
             },
             label = {
                 val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.Home) 1f else 0f,
+                    targetValue = if (selectedScreen == Screen.LocalMusic) 1f else 0f,
                     animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
                     label = "DockLibraryLabel"
                 )
                 Text(
-                    appText("主页", "Home"),
+                    appText("音乐库", "Library"),
                     modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
                 )
             },
@@ -3606,7 +3750,10 @@ fun FullPlayerScreen(
     onBack: () -> Unit,
     isLandscape: Boolean,
     floatingDockVisible: Boolean,
-    fixedDockBottomPadding: androidx.compose.ui.unit.Dp = 0.dp
+    fixedDockBottomPadding: androidx.compose.ui.unit.Dp = 0.dp,
+    mvModeEnabled: Boolean = false,
+    onMvModeEnabledChange: (Boolean) -> Unit = {},
+    mvVideoPlayer: ExoPlayer? = null
 ) {
     val configuration = LocalConfiguration.current
     val baseArtworkSize = if (isLandscape) minOf(360, (configuration.screenHeightDp * 0.52f).toInt()).dp else 300.dp
@@ -3624,6 +3771,10 @@ fun FullPlayerScreen(
     }
     val dockControlPadding = floatingDockControlPadding + fixedDockBottomPadding
     var showLyrics by remember { mutableStateOf(false) }
+    // MV 模式下退出歌词（模式状态本身由主界面持有，切页不丢失）
+    LaunchedEffect(mvModeEnabled) {
+        if (mvModeEnabled) showLyrics = false
+    }
     var quickListExpanded by remember { mutableStateOf(false) }
     var sliderPosition by remember { mutableFloatStateOf(0f) }
     var isDragging by remember { mutableStateOf(false) }
@@ -3653,14 +3804,21 @@ fun FullPlayerScreen(
     LaunchedEffect(song.uri, isPlaying) {
         spectrumProgressEnabled = playerPrefs.getBoolean("spectrum_progress_enabled", true)
     }
+    // 点阵鼓点：仍用当前进度窗口的实时频谱
     val fileSpectrumEnabled = isPlaying && animationsEnabled &&
-        (spectrumProgressEnabled ||
-            (AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled))
+        AlbumDotMatrixSettings.enabled && AlbumDotMatrixSettings.visualizerDepthEnabled
     val fileSpectrum = rememberAudioFileSpectrum(
         context = context,
         uri = song.uri,
         positionMs = position,
         enabled = fileSpectrumEnabled,
+        bandCount = 80
+    )
+    // 进度条频谱：整首曲目的静态频谱轮廓（每曲目计算一次）
+    val trackSpectrum = rememberAudioTrackSpectrum(
+        context = context,
+        uri = song.uri,
+        enabled = spectrumProgressEnabled && animationsEnabled,
         bandCount = 80
     )
     val beatEnergy = if (AlbumDotMatrixSettings.enabled && fileSpectrum.isNotEmpty()) {
@@ -3749,6 +3907,14 @@ fun FullPlayerScreen(
                         AnimatedSongText(song, songs, MaterialTheme.typography.headlineMedium)
                         AnimatedArtistText(song, songs, MaterialTheme.typography.titleMedium)
                     }
+                    if (song.videoUri != null) {
+                        IconButton(onClick = { onMvModeEnabledChange(!mvModeEnabled) }) {
+                            Icon(
+                                if (mvModeEnabled) Icons.Default.MusicNote else Icons.Default.Movie,
+                                contentDescription = "切换 MV/音乐"
+                            )
+                        }
+                    }
                     Icon(
                         Icons.Default.Sensors,
                         contentDescription = null,
@@ -3818,7 +3984,7 @@ fun FullPlayerScreen(
                             },
                             isPlaying = isPlaying,
                             spectrumEnabled = spectrumProgressEnabled,
-                            spectrumBars = fileSpectrum,
+                            spectrumBars = trackSpectrum,
                             colors = SliderDefaults.colors(
                                 thumbColor = MaterialTheme.colorScheme.onSurface,
                                 activeTrackColor = MaterialTheme.colorScheme.onSurface
@@ -3847,7 +4013,17 @@ fun FullPlayerScreen(
                         modifier = Modifier.weight(0.53f).fillMaxHeight(),
                         contentAlignment = Alignment.Center
                     ) {
-                        LyricView(lyrics, position, duration, onSeek)
+                        val mvUri = song.videoUri
+                        val mvPlayer = mvVideoPlayer
+                        if (mvUri != null && mvModeEnabled && mvPlayer != null) {
+                            MvVideoArea(
+                                videoPlayer = mvPlayer,
+                                videoUri = mvUri,
+                                modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(20.dp))
+                            )
+                        } else {
+                            LyricView(lyrics, position, duration, onSeek)
+                        }
                     }
                 }
             }
@@ -3889,7 +4065,15 @@ fun FullPlayerScreen(
                 ) { (targetShowLyrics, targetUri) ->
                     val targetSong = songs.firstOrNull { it.uri == targetUri } ?: song
                     val targetArtwork = rememberArtwork(targetSong)
-                    if (targetShowLyrics) {
+                    val targetMvUri = targetSong.videoUri
+                    val mvPlayer = mvVideoPlayer
+                    if (targetMvUri != null && mvModeEnabled && mvPlayer != null) {
+                        MvVideoArea(
+                            videoPlayer = mvPlayer,
+                            videoUri = targetMvUri,
+                            modifier = Modifier.size(artworkSize).clip(artworkShape)
+                        )
+                    } else if (targetShowLyrics) {
                         LyricView(lyrics, position, duration, onSeek, edgeToEdge = true)
                     } else {
                         if (isDjMode) {
@@ -3975,6 +4159,14 @@ fun FullPlayerScreen(
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             AnimatedSongText(song = song, songs = songs, titleStyle = MaterialTheme.typography.titleLarge, titleModifier = Modifier.weight(1f))
+                            if (song.videoUri != null) {
+                                IconButton(onClick = { onMvModeEnabledChange(!mvModeEnabled) }) {
+                                    Icon(
+                                        if (mvModeEnabled) Icons.Default.MusicNote else Icons.Default.Movie,
+                                        contentDescription = "切换 MV/音乐"
+                                    )
+                                }
+                            }
                             Box {
                                 IconButton(onClick = { quickListExpanded = true }) {
                                     Icon(Icons.Default.QueueMusic, "快捷音乐列表")
@@ -4008,6 +4200,14 @@ fun FullPlayerScreen(
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
                             AnimatedSongText(song = song, songs = songs, titleStyle = MaterialTheme.typography.headlineMedium)
+                        }
+                        if (song.videoUri != null) {
+                            IconButton(onClick = { onMvModeEnabledChange(!mvModeEnabled) }) {
+                                Icon(
+                                    if (mvModeEnabled) Icons.Default.MusicNote else Icons.Default.Movie,
+                                    contentDescription = "切换 MV/音乐"
+                                )
+                            }
                         }
                         Box {
                             IconButton(onClick = { quickListExpanded = true }) {
@@ -4073,7 +4273,7 @@ fun FullPlayerScreen(
                     },
                     isPlaying = isPlaying,
                     spectrumEnabled = spectrumProgressEnabled,
-                    spectrumBars = fileSpectrum,
+                    spectrumBars = trackSpectrum,
                     colors = SliderDefaults.colors(
                         thumbColor = MaterialTheme.colorScheme.primary,
                         activeTrackColor = MaterialTheme.colorScheme.primary
@@ -4431,13 +4631,6 @@ fun LyricView(
                     .blur(lyricBlur)
                     .graphicsLayer {
                         alpha = textAlpha
-                        val activeScale = when (lyricStyle) {
-                            "immersive" -> 1.04f
-                            "compact" -> 1.01f
-                            else -> 1.025f
-                        }
-                        scaleX = if (isCurrent && lyricAnimations) activeScale else 1f
-                        scaleY = if (isCurrent && lyricAnimations) activeScale else 1f
                     },
                 horizontalAlignment = when (lyricAlignment) {
                     "center" -> Alignment.CenterHorizontally
@@ -4445,11 +4638,6 @@ fun LyricView(
                     else -> Alignment.Start
                 }
             ) {
-                val currentSize = when (lyricStyle) {
-                    "compact" -> 26f
-                    "immersive" -> 34f
-                    else -> 30f
-                }
                 val inactiveSize = when (lyricStyle) {
                     "compact" -> 18f
                     "immersive" -> 24f
@@ -4457,8 +4645,8 @@ fun LyricView(
                 }
                 val textStyle = if (isCurrent) {
                     MaterialTheme.typography.headlineMedium.copy(
-                        fontSize = (currentSize * lyricFontScale).sp,
-                        lineHeight = ((currentSize + 6f) * lyricFontScale).sp,
+                        fontSize = (inactiveSize * lyricFontScale).sp,
+                        lineHeight = ((inactiveSize + 6f) * lyricFontScale).sp,
                         fontWeight = FontWeight.Black,
                         textAlign = lineTextAlign
                     )
@@ -4692,6 +4880,7 @@ private fun parseLrcContent(content: String): List<Pair<Long, String>> {
 
 fun formatTime(ms: Long): String { val totalSeconds = ms / 1000; val minutes = totalSeconds / 60; val seconds = totalSeconds % 60; return String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds) }
 fun isMusicFile(name: String?): Boolean { val lower = name?.lowercase() ?: return false; return lower.endsWith(".mp3") || lower.endsWith(".flac") || lower.endsWith(".wav") || lower.endsWith(".m4a") || lower.endsWith(".ogg") }
+fun isVideoFile(name: String?): Boolean { val lower = name?.lowercase() ?: return false; return listOf(".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp", ".ts").any { lower.endsWith(it) } }
 fun formatFileSize(size: Long): String { if (size <= 0) return "0 B"; val units = arrayOf("B", "KB", "MB", "GB"); val digitGroups = (log10(size.toDouble()) / log10(1024.0)).toInt(); return String.format(Locale.getDefault(), "%.1f %s", size / 1024.0.pow(digitGroups.toDouble()), units[digitGroups]) }
 
 fun buildMediaItem(song: Song): MediaItem {
