@@ -11,14 +11,12 @@ sealed class Screen {
     data object LyricsSettings : Screen()
     data object AudioCodecs : Screen()
     data object AboutSupport : Screen()
-    data object Equalizer : Screen()
     data object LocalMusic : Screen()
     data object PlayerView : Screen()
 
     fun backDestination(): Screen? = when (this) {
         LocalMusic -> null
         PlayerView -> LocalMusic
-        Equalizer -> LocalMusic
         Settings -> LocalMusic
         Library, Data, Playback, AudioOutput, Personalization, LyricsAndDevices, LyricsSettings, AudioCodecs,
         AboutSupport -> Settings

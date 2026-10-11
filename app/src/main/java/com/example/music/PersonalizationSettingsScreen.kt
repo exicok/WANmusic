@@ -14,7 +14,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Brightness2
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.ScreenRotation
@@ -40,27 +39,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.edit
-
-object MusicLibraryStyleSettings {
-    private const val PREFS = "music_prefs"
-    private const val KEY_DECK_STYLE = "music_library_deck_style"
-
-    var deckStyleEnabled by mutableStateOf(true)
-        private set
-
-    fun load(context: Context) {
-        deckStyleEnabled = context
-            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_DECK_STYLE, true)
-    }
-
-    fun setDeckStyleEnabled(context: Context, enabled: Boolean) {
-        deckStyleEnabled = enabled
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit {
-            putBoolean(KEY_DECK_STYLE, enabled)
-        }
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -133,32 +111,6 @@ fun PersonalizationSettingsScreen(
                     }
                 }
             }
-
-            SettingsSectionHeader(appText("音乐库", "Music library"))
-            ListItem(
-                headlineContent = { Text(appText("卡片堆叠音乐库", "Stacked card library")) },
-                supportingContent = {
-                    Text(
-                        appText(
-                            "上下吸附切换卡片，向右滑动当前卡片播放",
-                            "Snap between cards vertically and swipe the current card right to play"
-                        )
-                    )
-                },
-                leadingContent = { Icon(Icons.Default.LibraryMusic, null) },
-                trailingContent = {
-                    Switch(
-                        checked = MusicLibraryStyleSettings.deckStyleEnabled,
-                        onCheckedChange = { MusicLibraryStyleSettings.setDeckStyleEnabled(context, it) }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    MusicLibraryStyleSettings.setDeckStyleEnabled(
-                        context,
-                        !MusicLibraryStyleSettings.deckStyleEnabled
-                    )
-                }
-            )
 
             SettingsSectionHeader(appText("播放页", "Player"))
             ListItem(

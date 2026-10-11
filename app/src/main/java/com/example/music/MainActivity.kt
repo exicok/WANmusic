@@ -7,11 +7,16 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.media.MediaCodecList
+import android.media.MediaFormat
 import android.net.Uri
 import android.os.Bundle
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.LruCache
 import android.view.SurfaceView
+import android.view.PixelCopy
+import android.view.Choreographer
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
@@ -36,10 +41,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.HighQuality
@@ -90,10 +94,12 @@ import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.AudioAttributes
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.video.VideoFrameMetadataListener
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.delay
@@ -115,6 +121,7 @@ import com.kyant.backdrop.effects.vibrancy
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.FutureTask
 import kotlin.math.log10
 import kotlin.math.pow
@@ -122,8 +129,11 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -635,7 +645,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             remember(this) {
                 AlbumDotMatrixSettings.load(this)
-                MusicLibraryStyleSettings.load(this)
                 true
             }
             var isAmoledMode by remember { mutableStateOf(savedAmoledMode) }
@@ -1372,9 +1381,6 @@ fun MusicApp(
                         Screen.AboutSupport -> AboutSupportScreen(
                             onBack = handleBack
                         )
-                        Screen.Equalizer -> EqualizerSettingsScreen(
-                            onBack = handleBack
-                        )
                     }
                     }
                 }
@@ -1454,17 +1460,12 @@ fun LocalMusicScreen(
     protectStatusBarContent: Boolean = true
 ) {
     val context = LocalContext.current
-    val deckStyleEnabled = MusicLibraryStyleSettings.deckStyleEnabled
     val savedScroll = remember { ListScrollMemory.load(context) }
     val listState = rememberLazyListState(
         initialFirstVisibleItemIndex = savedScroll.first,
         initialFirstVisibleItemScrollOffset = savedScroll.second
     )
-    val listSnapBehavior = rememberSnapFlingBehavior(lazyListState = listState)
-    var draggingItemIndex by remember { mutableStateOf<Int?>(null) }
-    var dragOffset by remember { mutableFloatStateOf(0f) }
     var detailSong by remember { mutableStateOf<Song?>(null) }
-    var centeredSongIndex by remember { mutableIntStateOf(savedScroll.first.coerceAtLeast(0)) }
 
     // 记录滑动位置，返回音乐页时恢复
     LaunchedEffect(listState, songs.size) {
@@ -1487,26 +1488,6 @@ fun LocalMusicScreen(
         if (listState.firstVisibleItemIndex > maxIndex) {
             listState.scrollToItem(maxIndex)
         }
-    }
-
-    LaunchedEffect(listState, songs.size, deckStyleEnabled) {
-        if (!deckStyleEnabled) return@LaunchedEffect
-        snapshotFlow {
-            val layoutInfo = listState.layoutInfo
-            val viewportCenter =
-                (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
-            layoutInfo.visibleItemsInfo.minByOrNull { item ->
-                kotlin.math.abs(item.offset + item.size / 2 - viewportCenter)
-            }?.index
-        }
-            .distinctUntilChanged()
-            // 滚动过程中限制中央卡片状态提交频率，避免每一帧重组所有卡片。
-            .debounce(32)
-            .collectLatest { centeredIndex ->
-                if (centeredIndex != null && centeredIndex in songs.indices) {
-                    centeredSongIndex = centeredIndex
-                }
-            }
     }
 
     Box(
@@ -1552,7 +1533,7 @@ fun LocalMusicScreen(
                         Text(appText("暂无本地音乐", "No local music"), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-            } else if (!deckStyleEnabled) {
+            } else {
                 TraditionalMusicList(
                     songs = songs,
                     listState = listState,
@@ -1561,157 +1542,6 @@ fun LocalMusicScreen(
                     onSongLongClick = { detailSong = it },
                     onReorder = onReorder
                 )
-            } else {
-                BoxWithConstraints(Modifier.fillMaxSize()) {
-                    val cardExtent = 142.dp
-                    val centerPadding = ((maxHeight - cardExtent) / 2).coerceAtLeast(24.dp)
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        flingBehavior = listSnapBehavior,
-                        contentPadding = PaddingValues(
-                            top = centerPadding,
-                            bottom = bottomContentPadding + centerPadding
-                        ),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                    itemsIndexed(songs, key = { _, song -> song.uri.toString() }) { index, song ->
-                        val artwork = rememberArtwork(song, maxPx = 96)
-                        val isDragging = index == draggingItemIndex
-                        val isCentered = index == centeredSongIndex
-                        val centerDistance = (index - centeredSongIndex).coerceIn(-3, 3)
-                        var playSwipeOffset by remember(song.uri) { mutableFloatStateOf(0f) }
-                        val playSwipeThreshold = with(LocalDensity.current) { 72.dp.toPx() }
-                        
-                        ListItem(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .graphicsLayer {
-                                    translationY = if (isDragging) dragOffset else 0f
-                                    translationX = playSwipeOffset + kotlin.math.abs(centerDistance) * 18.dp.toPx()
-                                    rotationZ = -centerDistance * 5.5f
-                                    alpha = if (isDragging) 0.8f else if (isCentered) 1f else 0.58f
-                                    scaleX = if (isDragging) 1.02f else if (isCentered) 1f else 0.88f
-                                    scaleY = if (isDragging) 1.02f else if (isCentered) 1f else 0.88f
-                                    shadowElevation = if (isDragging) 8f else 0f
-                                }
-                                .padding(horizontal = if (isCentered) 16.dp else 28.dp, vertical = 7.dp)
-                                .height(128.dp)
-                                .clip(RoundedCornerShape(22.dp))
-                                .background(
-                                    if (isCentered) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
-                                    else MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.24f)
-                                )
-                                .border(
-                                    1.dp,
-                                    if (isCentered) Color.White.copy(alpha = 0.42f)
-                                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.24f),
-                                    RoundedCornerShape(22.dp)
-                                )
-                                .pointerInput(song.uri, isCentered) {
-                                    if (!isCentered) return@pointerInput
-                                    detectHorizontalDragGestures(
-                                        onDragEnd = {
-                                            if (playSwipeOffset >= playSwipeThreshold) onSongClick(song)
-                                            playSwipeOffset = 0f
-                                        },
-                                        onDragCancel = { playSwipeOffset = 0f }
-                                    ) { change, dragAmount ->
-                                        if (dragAmount > 0f || playSwipeOffset > 0f) {
-                                            change.consume()
-                                            playSwipeOffset = (playSwipeOffset + dragAmount)
-                                                .coerceIn(0f, playSwipeThreshold * 1.35f)
-                                        }
-                                    }
-                                }
-                                .combinedClickable(
-                                    enabled = draggingItemIndex == null,
-                                    onClick = {},
-                                    onLongClick = { detailSong = song }
-                                ),
-                            headlineContent = {
-                                Text(
-                                    song.title,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = if (isCentered) MaterialTheme.typography.headlineSmall
-                                    else MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            },
-                            supportingContent = { Text(song.artist, style = MaterialTheme.typography.titleMedium) },
-                            trailingContent = {
-                                Box(
-                                    modifier = Modifier.size(100.dp),
-                                    contentAlignment = Alignment.CenterEnd
-                                ) {
-                                    if (artwork != null) {
-                                        androidx.compose.foundation.Image(
-                                            bitmap = artwork.asImageBitmap(),
-                                            contentDescription = null,
-                                            modifier = Modifier
-                                                .size(if (isCentered) 92.dp else 78.dp)
-                                                .clip(RoundedCornerShape(18.dp)),
-                                            contentScale = ContentScale.Crop
-                                        )
-                                    } else {
-                                        Icon(
-                                            Icons.Default.MusicNote,
-                                            contentDescription = null,
-                                            modifier = Modifier
-                                                .align(Alignment.CenterEnd)
-                                                .size(if (isCentered) 64.dp else 54.dp)
-                                        )
-                                    }
-                                    Icon(
-                                        Icons.Default.DragHandle,
-                                        contentDescription = appText("拖动排序", "Drag to reorder"),
-                                        modifier = Modifier
-                                            .align(Alignment.BottomStart)
-                                            .size(28.dp)
-                                            .padding(4.dp)
-                                            .pointerInput(song.uri) {
-                                                detectDragGesturesAfterLongPress(
-                                                    onDragStart = {
-                                                        draggingItemIndex = index
-                                                        dragOffset = 0f
-                                                    },
-                                                    onDrag = { change, dragAmount ->
-                                                        change.consume()
-                                                        dragOffset += dragAmount.y
-
-                                                        val threshold = 50f
-                                                        if (dragOffset > threshold && index < songs.lastIndex) {
-                                                            onReorder(index, index + 1)
-                                                            draggingItemIndex = index + 1
-                                                            dragOffset -= 142.dp.toPx()
-                                                        } else if (dragOffset < -threshold && index > 0) {
-                                                            onReorder(index, index - 1)
-                                                            draggingItemIndex = index - 1
-                                                            dragOffset += 142.dp.toPx()
-                                                        }
-                                                    },
-                                                    onDragEnd = {
-                                                        draggingItemIndex = null
-                                                        dragOffset = 0f
-                                                    },
-                                                    onDragCancel = {
-                                                        draggingItemIndex = null
-                                                        dragOffset = 0f
-                                                    }
-                                                )
-                                            },
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.48f)
-                                    )
-                                }
-                            },
-                            colors = ListItemDefaults.colors(
-                                containerColor = Color.Transparent
-                            )
-                        )
-                    }
-                }
-            }
         }
     }
 
@@ -2128,10 +1958,18 @@ private fun FloatingDockWindow(
 private fun MvVideoSurface(
     videoPlayer: ExoPlayer,
     videoUri: Uri,
+    surfaceState: MutableState<SurfaceView?>,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current.applicationContext
     val surfaceView = remember { SurfaceView(context) }
+    // 交给播放页背景层做低分辨率取帧
+    DisposableEffect(surfaceView) {
+        surfaceState.value = surfaceView
+        onDispose {
+            if (surfaceState.value === surfaceView) surfaceState.value = null
+        }
+    }
     var videoAspectRatio by remember(videoUri) { mutableFloatStateOf(0f) }
     LaunchedEffect(videoUri) {
         videoAspectRatio = withContext(Dispatchers.IO) {
@@ -2175,19 +2013,138 @@ private fun MvVideoSurface(
 private fun MvVideoArea(
     videoPlayer: ExoPlayer,
     videoUri: Uri,
+    surfaceState: MutableState<SurfaceView?>,
     modifier: Modifier = Modifier
 ) {
     MvVideoSurface(
         videoPlayer = videoPlayer,
         videoUri = videoUri,
+        surfaceState = surfaceState,
         modifier = modifier
     )
+}
+
+/** 取帧下限间隔：优先用解码器上报的帧率，取不到时按 30fps。 */
+private fun mvFrameIntervalMs(videoPlayer: ExoPlayer?): Long {
+    val frameRate = runCatching { videoPlayer?.videoFormat?.frameRate }.getOrNull() ?: 0f
+    return if (frameRate.isFinite() && frameRate in 1f..240f) {
+        (1000L / frameRate.toLong()).coerceIn(8L, 1000L)
+    } else 33L
+}
+
+/** 挂起直到下一个显示 vsync，返回该帧时间戳（纳秒）。 */
+private suspend fun awaitVsync(): Long = suspendCancellableCoroutine { cont ->
+    Choreographer.getInstance().postFrameCallback { frameTimeNanos ->
+        if (cont.isActive) cont.resume(frameTimeNanos)
+    }
+}
+
+/**
+ * 从 MV 渲染表面取帧，供播放页背景层放大模糊成动态底色。
+ * 取帧跟随视频逐帧渲染回调：渲染线程每出一帧才抓一张，并等下一个 vsync 让这一帧
+ * 完成合成，背景与画面的延迟因此控制在 1~2 帧内；解码器不回调时退化为按帧率轮询。
+ * 像素没变化就不发布新位图，暂停或熄屏时不会空转重组。
+ */
+@Composable
+private fun rememberMvBackdropFrame(
+    videoPlayer: ExoPlayer?,
+    surfaceState: MutableState<SurfaceView?>,
+    enabled: Boolean
+): Bitmap? {
+    var frame by remember { mutableStateOf<Bitmap?>(null) }
+    val handler = remember { Handler(Looper.getMainLooper()) }
+    // 渲染线程只写这两个计数，采样循环读它们判断有没有新画面
+    val frameGeneration = remember { AtomicLong(0L) }
+    val frameSignalNanos = remember { AtomicLong(0L) }
+    DisposableEffect(videoPlayer) {
+        val player = videoPlayer
+        if (player == null) {
+            onDispose { }
+        } else {
+            val listener = object : VideoFrameMetadataListener {
+                override fun onVideoFrameAboutToBeRendered(
+                    presentationTimeUs: Long,
+                    releaseTimeNs: Long,
+                    format: Format,
+                    outputImage: MediaFormat?
+                ) {
+                    frameSignalNanos.set(System.nanoTime())
+                    frameGeneration.incrementAndGet()
+                }
+            }
+            // 注册失败（部分解码路径不支持）时由采样循环的轮询分支兜底
+            runCatching { player.setVideoFrameMetadataListener(listener) }
+            onDispose { runCatching { player.clearVideoFrameMetadataListener(listener) } }
+        }
+    }
+    LaunchedEffect(enabled, surfaceState.value, videoPlayer) {
+        if (!enabled) return@LaunchedEffect
+        var lastPixels: IntArray? = null
+        var lastCopiedGeneration = -1L
+        var lastCopyNanos = 0L
+        while (isActive) {
+            // 对齐显示 vsync：既做节拍，也给刚渲染的帧留出合成时间
+            val frameTimeNanos = awaitVsync()
+            val generation = frameGeneration.get()
+            val callbackAlive = generation > 0L &&
+                frameTimeNanos - frameSignalNanos.get() < 1_500_000_000L
+            val minIntervalNs = mvFrameIntervalMs(videoPlayer) * 1_000_000L
+            val idle = !callbackAlive && videoPlayer?.isPlaying != true
+            val due = when {
+                callbackAlive -> generation != lastCopiedGeneration
+                idle -> frameTimeNanos - lastCopyNanos > 200_000_000L
+                else -> frameTimeNanos - lastCopyNanos >= minIntervalNs
+            }
+            if (!due) continue
+            lastCopiedGeneration = generation
+            lastCopyNanos = frameTimeNanos
+            val surfaceView = surfaceState.value
+            val sourceWidth = surfaceView?.width ?: 0
+            val sourceHeight = surfaceView?.height ?: 0
+            if (surfaceView == null || sourceWidth <= 0 || sourceHeight <= 0) {
+                delay(200L)
+                continue
+            }
+            val target = Bitmap.createBitmap(
+                64,
+                (64 * sourceHeight / sourceWidth).coerceIn(16, 128),
+                Bitmap.Config.ARGB_8888
+            )
+            val copied = suspendCancellableCoroutine { cont ->
+                // 失败（无新帧/超时）时丢弃这张，正在显示的位图绝不回收
+                val requested = runCatching {
+                    PixelCopy.request(surfaceView, target, { result ->
+                        if (result != PixelCopy.SUCCESS) target.recycle()
+                        if (cont.isActive) cont.resume(result == PixelCopy.SUCCESS)
+                    }, handler)
+                }.isSuccess
+                if (!requested) {
+                    target.recycle()
+                    if (cont.isActive) cont.resume(false)
+                }
+            }
+            if (!copied) continue
+            // 拷贝期间又渲染了若干帧，视为已全部消化，避免连续追赶取帧
+            lastCopiedGeneration = frameGeneration.get()
+            val pixels = IntArray(target.width * target.height)
+            target.getPixels(pixels, 0, target.width, 0, 0, target.width, target.height)
+            val previous = lastPixels
+            if (previous == null || previous.size != pixels.size || !previous.contentEquals(pixels)) {
+                lastPixels = pixels
+                // 旧帧交给 GC，主动回收可能撞上正在绘制的那一帧
+                frame = target
+            } else {
+                lastPixels = previous
+                target.recycle()
+            }
+        }
+    }
+    return frame
 }
 
 private fun dockRootScreen(screen: Screen): Screen = when (screen) {
     Screen.LocalMusic -> Screen.LocalMusic
     Screen.PlayerView -> Screen.PlayerView
-    Screen.Equalizer -> Screen.Equalizer
     else -> Screen.Settings
 }
 
@@ -2199,7 +2156,7 @@ private fun MusicDock(
     floating: Boolean = false
 ) {
     val dockScreens = remember {
-        listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Equalizer, Screen.Settings)
+        listOf(Screen.LocalMusic, Screen.PlayerView, Screen.Settings)
     }
     val selectedScreen = dockRootScreen(currentScreen)
     val md3ItemColors = NavigationBarItemDefaults.colors(
@@ -2215,7 +2172,6 @@ private fun MusicDock(
         val destinations = listOf(
             Triple(Screen.LocalMusic, Icons.Default.LibraryMusic, appText("音乐库", "Library")),
             Triple(Screen.PlayerView, Icons.Default.PlayCircle, appText("播放", "Player")),
-            Triple(Screen.Equalizer, Icons.Default.Equalizer, appText("均衡", "EQ")),
             Triple(Screen.Settings, Icons.Default.Settings, appText("设置", "Settings"))
         )
         val dockItemAnimation = if (AppAnimationSettings.enabled) {
@@ -2400,38 +2356,6 @@ private fun MusicDock(
             colors = md3ItemColors
         )
         NavigationBarItem(
-            selected = selectedScreen == Screen.Equalizer,
-            onClick = { onNavigate(Screen.Equalizer) },
-            icon = {
-                val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.Equalizer) 1f else 0f,
-                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
-                    label = "DockEqIcon"
-                )
-                Icon(
-                    Icons.Default.Equalizer,
-                    appText("均衡器", "Equalizer"),
-                    modifier = Modifier.graphicsLayer {
-                        scaleX = 0.9f + progress * 0.16f
-                        scaleY = 0.9f + progress * 0.16f
-                        alpha = 0.72f + progress * 0.28f
-                    }
-                )
-            },
-            label = {
-                val progress by animateFloatAsState(
-                    targetValue = if (selectedScreen == Screen.Equalizer) 1f else 0f,
-                    animationSpec = if (AppAnimationSettings.enabled) spring() else snap(),
-                    label = "DockEqLabel"
-                )
-                Text(
-                    appText("均衡器", "Equalizer"),
-                    modifier = Modifier.graphicsLayer { alpha = 0.72f + progress * 0.28f }
-                )
-            },
-            colors = md3ItemColors
-        )
-        NavigationBarItem(
             selected = selectedScreen == Screen.Settings,
             onClick = { onNavigate(Screen.Settings) },
             icon = {
@@ -2562,430 +2486,6 @@ fun PlaybackSettingsScreen(
             }
         }
     }
-
-private data class EqualizerPreset(val name: String, val gains: IntArray)
-
-private val equalizerFrequencies = intArrayOf(31, 62, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000)
-private val builtInEqualizerPresets = listOf(
-    EqualizerPreset("平直", intArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
-    EqualizerPreset("摇滚", intArrayOf(5, 4, 3, 1, -1, -1, 1, 3, 4, 5)),
-    EqualizerPreset("古典", intArrayOf(4, 3, 2, 1, 0, 0, 1, 2, 3, 4)),
-    EqualizerPreset("流行", intArrayOf(-1, 1, 3, 4, 3, 1, -1, -1, 1, 2)),
-    EqualizerPreset("爵士", intArrayOf(3, 2, 1, 2, -1, -1, 1, 2, 3, 4)),
-    EqualizerPreset("人声清晰", intArrayOf(-3, -2, -1, 1, 3, 4, 4, 2, 1, 0)),
-    EqualizerPreset("原声", intArrayOf(2, 2, 1, 0, 1, 2, 3, 3, 2, 1)),
-    EqualizerPreset("电子", intArrayOf(5, 4, 1, 0, -2, 1, 2, 3, 5, 4)),
-    EqualizerPreset("嘻哈", intArrayOf(6, 5, 3, 1, -1, -1, 1, 2, 3, 2)),
-    EqualizerPreset("金属", intArrayOf(5, 4, 2, 0, -2, -1, 2, 4, 5, 4)),
-    EqualizerPreset("影院", intArrayOf(4, 3, 2, 1, 0, 2, 3, 4, 3, 2)),
-    EqualizerPreset("深夜", intArrayOf(-3, -2, 0, 2, 3, 3, 2, 0, -2, -3)),
-    EqualizerPreset("低音增强", intArrayOf(7, 6, 4, 2, 0, -1, -1, 0, 1, 2)),
-    EqualizerPreset("高保真", intArrayOf(3, 2, 1, 0, 0, 0, 1, 2, 3, 4)),
-    EqualizerPreset("播客", intArrayOf(-4, -3, -1, 2, 4, 5, 4, 2, 0, -2))
-)
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun EqualizerSettingsScreen(onBack: () -> Unit) {
-    val dockContentPadding = LocalDockContentPadding.current
-    val context = LocalContext.current
-    val preferences = remember { context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE) }
-    var gains by remember { mutableStateOf(loadEqualizerGains(preferences)) }
-    var eqEnabled by remember { mutableStateOf(preferences.getBoolean("equalizer_enabled", true)) }
-    var preampDb by remember { mutableIntStateOf(preferences.getInt("equalizer_preamp", 0).coerceIn(-6, 6)) }
-    var bassBoost by remember { mutableIntStateOf(preferences.getInt("bass_boost", 0).coerceIn(0, 1000)) }
-    var virtualizer by remember { mutableIntStateOf(preferences.getInt("virtualizer", 0).coerceIn(0, 1000)) }
-    var selectedPreset by remember { mutableStateOf(preferences.getString("equalizer_preset_name", "自定义") ?: "自定义") }
-    var presetMenuExpanded by remember { mutableStateOf(false) }
-    val applyScope = rememberCoroutineScope()
-    var pendingApplyJob by remember { mutableStateOf<Job?>(null) }
-
-    fun persistAndApply(
-        nextGains: IntArray = gains,
-        enabled: Boolean = eqEnabled,
-        preamp: Int = preampDb,
-        bass: Int = bassBoost,
-        virt: Int = virtualizer,
-        presetName: String = selectedPreset
-    ) {
-        preferences.edit {
-            putString("equalizer_gains", nextGains.joinToString(","))
-            putBoolean("equalizer_enabled", enabled)
-            putInt("equalizer_preamp", preamp)
-            putInt("bass_boost", bass)
-            putInt("virtualizer", virt)
-            putString("equalizer_preset_name", presetName)
-        }
-        pendingApplyJob?.cancel()
-        pendingApplyJob = applyScope.launch {
-            delay(35)
-            applyEqualizerSettings(
-                context = context,
-                gains = nextGains,
-                enabled = enabled,
-                preampDb = preamp,
-                bassBoost = bass,
-                virtualizer = virt
-            )
-        }
-    }
-
-    // 进入页面时重新下发一次，确保挂到当前播放会话
-    LaunchedEffect(Unit) {
-        applyEqualizerSettings(context, gains, eqEnabled, preampDb, bassBoost, virtualizer)
-    }
-
-    val personalPreset = remember {
-        preferences.getString("equalizer_custom_gains", null)?.let(::parseEqualizerGains)
-    }
-    val presets = remember(personalPreset) {
-        builtInEqualizerPresets + listOfNotNull(personalPreset?.let { EqualizerPreset("个人", it) })
-    }
-
-    val primary = MaterialTheme.colorScheme.primary
-    val secondary = MaterialTheme.colorScheme.secondary
-    val outline = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("专业均衡器") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-                    }
-                },
-                actions = {
-                    IconButton(
-                        onClick = {
-                            gains = IntArray(equalizerFrequencies.size)
-                            preampDb = 0
-                            bassBoost = 0
-                            virtualizer = 0
-                            selectedPreset = "平直"
-                            persistAndApply(
-                                nextGains = gains,
-                                preamp = 0,
-                                bass = 0,
-                                virt = 0,
-                                presetName = "平直"
-                            )
-                        }
-                    ) {
-                        Icon(Icons.Default.RestartAlt, "重置")
-                    }
-                }
-            )
-        }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .padding(bottom = dockContentPadding)
-        ) {
-            ListItem(
-                headlineContent = { Text("启用均衡器") },
-                supportingContent = {
-                    Text(if (eqEnabled) "频段、前置增益、低音与环绕均生效" else "已旁路，输出接近原始音质")
-                },
-                leadingContent = { Icon(Icons.Default.GraphicEq, null) },
-                trailingContent = {
-                    Switch(
-                        checked = eqEnabled,
-                        onCheckedChange = {
-                            eqEnabled = it
-                            persistAndApply(enabled = it)
-                        }
-                    )
-                },
-                modifier = Modifier.clickable {
-                    eqEnabled = !eqEnabled
-                    persistAndApply(enabled = eqEnabled)
-                }
-            )
-
-            Text(
-                "10 段参数均衡 + 前置增益 + 低音增强 + 环绕声场。调节后立即作用于当前播放。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Spacer(Modifier.height(12.dp))
-            Text("频率响应", style = MaterialTheme.typography.titleMedium, color = primary)
-            Spacer(Modifier.height(8.dp))
-            // 专业响应曲线
-            Canvas(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(140.dp)
-            ) {
-                val left = 8.dp.toPx()
-                val right = size.width - 8.dp.toPx()
-                val top = 12.dp.toPx()
-                val bottom = size.height - 18.dp.toPx()
-                val midY = (top + bottom) / 2f
-                val width = (right - left).coerceAtLeast(1f)
-                val height = (bottom - top).coerceAtLeast(1f)
-
-                // 网格
-                for (i in 0..4) {
-                    val y = top + height * i / 4f
-                    drawLine(outline, Offset(left, y), Offset(right, y), strokeWidth = 1f)
-                }
-                for (i in 0 until equalizerFrequencies.size) {
-                    val x = left + width * i / (equalizerFrequencies.size - 1).coerceAtLeast(1)
-                    drawLine(outline.copy(alpha = 0.2f), Offset(x, top), Offset(x, bottom), 1f)
-                }
-                // 0dB 线
-                drawLine(primary.copy(alpha = 0.35f), Offset(left, midY), Offset(right, midY), 2f)
-
-                if (gains.isNotEmpty()) {
-                    val maxDb = 15f
-                    val pts = gains.mapIndexed { index, g ->
-                        val x = left + width * index / (gains.size - 1).coerceAtLeast(1)
-                        val total = (g + preampDb).coerceIn(-15, 15).toFloat()
-                        val y = midY - (total / maxDb) * (height / 2f)
-                        Offset(x, y)
-                    }
-                    // 填充
-                    val fillPath = Path().apply {
-                        moveTo(pts.first().x, midY)
-                        pts.forEach { lineTo(it.x, it.y) }
-                        lineTo(pts.last().x, midY)
-                        close()
-                    }
-                    drawPath(
-                        fillPath,
-                        brush = Brush.verticalGradient(
-                            listOf(primary.copy(alpha = 0.28f), secondary.copy(alpha = 0.08f))
-                        )
-                    )
-                    // 曲线
-                    for (i in 0 until pts.lastIndex) {
-                        drawLine(
-                            color = if (eqEnabled) primary else outline,
-                            start = pts[i],
-                            end = pts[i + 1],
-                            strokeWidth = 3.dp.toPx()
-                        )
-                    }
-                    pts.forEach { p ->
-                        drawCircle(
-                            color = if (eqEnabled) secondary else outline,
-                            radius = 3.5.dp.toPx(),
-                            center = p
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-            Box {
-                OutlinedButton(onClick = { presetMenuExpanded = true }, enabled = eqEnabled) {
-                    Icon(Icons.Default.Tune, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("预设：$selectedPreset")
-                    Spacer(Modifier.width(8.dp))
-                    Icon(Icons.Default.ArrowDropDown, null)
-                }
-                DropdownMenu(
-                    expanded = presetMenuExpanded,
-                    onDismissRequest = { presetMenuExpanded = false }
-                ) {
-                    presets.forEach { preset ->
-                        DropdownMenuItem(
-                            text = { Text(preset.name) },
-                            onClick = {
-                                gains = preset.gains.copyOf()
-                                selectedPreset = preset.name
-                                presetMenuExpanded = false
-                                persistAndApply(nextGains = gains, presetName = preset.name)
-                            }
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
-            Text("前置增益", style = MaterialTheme.typography.titleSmall, color = primary)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Preamp", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
-                Slider(
-                    value = preampDb.toFloat(),
-                    onValueChange = {
-                        preampDb = it.toInt()
-                        selectedPreset = "自定义"
-                        persistAndApply(preamp = preampDb, presetName = "自定义")
-                    },
-                    valueRange = -6f..6f,
-                    steps = 11,
-                    enabled = eqEnabled,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = String.format(Locale.getDefault(), "%+d dB", preampDb),
-                    modifier = Modifier.width(62.dp),
-                    textAlign = TextAlign.End,
-                    style = MaterialTheme.typography.labelMedium
-                )
-            }
-
-            Text("低音增强", style = MaterialTheme.typography.titleSmall, color = primary)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Bass", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
-                Slider(
-                    value = bassBoost / 10f,
-                    onValueChange = {
-                        bassBoost = (it * 10f).toInt().coerceIn(0, 1000)
-                        persistAndApply(bass = bassBoost)
-                    },
-                    valueRange = 0f..100f,
-                    enabled = eqEnabled,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = "${bassBoost / 10}%",
-                    modifier = Modifier.width(62.dp),
-                    textAlign = TextAlign.End,
-                    style = MaterialTheme.typography.labelMedium
-                )
-            }
-
-            Text("环绕声场", style = MaterialTheme.typography.titleSmall, color = primary)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Space", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.labelLarge)
-                Slider(
-                    value = virtualizer / 10f,
-                    onValueChange = {
-                        virtualizer = (it * 10f).toInt().coerceIn(0, 1000)
-                        persistAndApply(virt = virtualizer)
-                    },
-                    valueRange = 0f..100f,
-                    enabled = eqEnabled,
-                    modifier = Modifier.weight(1f)
-                )
-                Text(
-                    text = "${virtualizer / 10}%",
-                    modifier = Modifier.width(62.dp),
-                    textAlign = TextAlign.End,
-                    style = MaterialTheme.typography.labelMedium
-                )
-            }
-
-            Spacer(Modifier.height(8.dp))
-            Text("十段参数均衡", style = MaterialTheme.typography.titleMedium, color = primary)
-            Spacer(Modifier.height(4.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.Bottom
-            ) {
-            equalizerFrequencies.forEachIndexed { index, frequency ->
-                Column(
-                    modifier = Modifier.width(42.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = formatEqualizerFrequency(frequency),
-                        maxLines = 1,
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                    Box(modifier = Modifier.height(150.dp).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Slider(
-                            value = gains[index].toFloat(),
-                            onValueChange = { value ->
-                                gains = gains.copyOf().also { it[index] = value.toInt() }
-                                selectedPreset = "自定义"
-                                persistAndApply(nextGains = gains, presetName = "自定义")
-                            },
-                            valueRange = -15f..15f,
-                            steps = 29,
-                            enabled = eqEnabled,
-                            modifier = Modifier.fillMaxWidth().rotate(-90f)
-                        )
-                    }
-                    Text(
-                        text = String.format(Locale.getDefault(), "%+d dB", gains[index]),
-                        textAlign = TextAlign.End,
-                        style = MaterialTheme.typography.labelMedium
-                    )
-                }
-            }
-            }
-
-            HorizontalDivider(Modifier.padding(vertical = 16.dp))
-            OutlinedButton(
-                onClick = {
-                    preferences.edit { putString("equalizer_custom_gains", gains.joinToString(",")) }
-                    selectedPreset = "个人"
-                    preferences.edit { putString("equalizer_preset_name", "个人") }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = eqEnabled
-            ) {
-                Icon(Icons.Default.Save, null)
-                Spacer(Modifier.width(6.dp))
-                Text("保存为个人预设")
-            }
-            Spacer(Modifier.height(72.dp))
-        }
-    }
-}
-
-
-private fun loadEqualizerGains(preferences: android.content.SharedPreferences): IntArray =
-    preferences.getString("equalizer_gains", null)?.let(::parseEqualizerGains)
-        ?: IntArray(equalizerFrequencies.size)
-
-private fun parseEqualizerGains(value: String): IntArray {
-    val values = value.split(',').mapNotNull { it.toIntOrNull() }
-    return IntArray(equalizerFrequencies.size) { values.getOrElse(it) { 0 }.coerceIn(-15, 15) }
-}
-
-private fun applyEqualizerSettings(
-    context: Context,
-    gains: IntArray,
-    enabled: Boolean = true,
-    preampDb: Int = 0,
-    bassBoost: Int = 0,
-    virtualizer: Int = 0
-) {
-    context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
-        .edit {
-            putString("equalizer_gains", gains.joinToString(","))
-            putBoolean("equalizer_enabled", enabled)
-            putInt("equalizer_preamp", preampDb)
-            putInt("bass_boost", bassBoost)
-            putInt("virtualizer", virtualizer)
-        }
-    val intent = Intent(context, PlaybackService::class.java)
-        .setAction(PlaybackService.ACTION_APPLY_EQUALIZER)
-        .putExtra(PlaybackService.EXTRA_GAINS, gains.copyOf())
-        .putExtra(PlaybackService.EXTRA_EQ_ENABLED, enabled)
-        .putExtra(PlaybackService.EXTRA_PREAMP, preampDb)
-        .putExtra(PlaybackService.EXTRA_BASS_BOOST, bassBoost)
-        .putExtra(PlaybackService.EXTRA_VIRTUALIZER, virtualizer)
-    // 前台应用内启动：优先普通 startService；失败再尝试前台服务启动
-    runCatching { context.startService(intent) }
-        .recoverCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }
-        .onFailure {
-            android.util.Log.e("Equalizer", "无法将均衡器参数发送到播放服务: ${it.message}")
-        }
-}
-
-private fun formatEqualizerFrequency(frequency: Int): String =
-    if (frequency >= 1_000) "${frequency / 1_000}kHz" else "${frequency}Hz"
-
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -3756,7 +3256,7 @@ fun FullPlayerScreen(
     mvVideoPlayer: ExoPlayer? = null
 ) {
     val configuration = LocalConfiguration.current
-    val baseArtworkSize = if (isLandscape) minOf(360, (configuration.screenHeightDp * 0.52f).toInt()).dp else 300.dp
+    val baseArtworkSize = if (isLandscape) minOf(320, (configuration.screenHeightDp * 0.45f).toInt()).dp else 252.dp
     val artworkShrink = if (AlbumDotMatrixSettings.enabled) 0.dp else with(LocalDensity.current) { 50f.toDp() }
     val artworkSize = maxOf(baseArtworkSize - artworkShrink, 0.dp)
     val artworkShape = RoundedCornerShape(if (isLandscape) 20.dp else 32.dp)
@@ -3794,6 +3294,13 @@ fun FullPlayerScreen(
 
     // 按需加载封面（避免播放页首次显示时主线程解码卡顿）
     val playerArtwork = rememberArtwork(song)
+    // MV 模式下背景改用视频实时取帧，模糊后作为动态底色
+    val mvSurfaceState = remember { mutableStateOf<SurfaceView?>(null) }
+    val mvBackdrop = rememberMvBackdropFrame(
+        videoPlayer = mvVideoPlayer,
+        surfaceState = mvSurfaceState,
+        enabled = mvModeEnabled && mvVideoPlayer != null && song.videoUri != null
+    )
     val playerPrefs = remember {
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
     }
@@ -3865,10 +3372,12 @@ fun FullPlayerScreen(
         ) { targetUri ->
             val targetSong = songs.firstOrNull { it.uri == targetUri } ?: song
             val targetArtwork = rememberArtwork(targetSong)
+            // MV 帧优先，未取到帧时退回封面
+            val backdrop = mvBackdrop ?: targetArtwork
             Box(Modifier.fillMaxSize()) {
-                if (targetArtwork != null) {
+                if (backdrop != null) {
                     androidx.compose.foundation.Image(
-                        bitmap = targetArtwork.asImageBitmap(),
+                        bitmap = backdrop.asImageBitmap(),
                         contentDescription = null,
                         modifier = Modifier
                             .fillMaxSize()
@@ -4019,10 +3528,11 @@ fun FullPlayerScreen(
                             MvVideoArea(
                                 videoPlayer = mvPlayer,
                                 videoUri = mvUri,
+                                surfaceState = mvSurfaceState,
                                 modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(20.dp))
                             )
                         } else {
-                            LyricView(lyrics, position, duration, onSeek)
+                            LyricView(lyrics, position, duration, onSeek, songArtwork = playerArtwork)
                         }
                     }
                 }
@@ -4071,10 +3581,11 @@ fun FullPlayerScreen(
                         MvVideoArea(
                             videoPlayer = mvPlayer,
                             videoUri = targetMvUri,
+                            surfaceState = mvSurfaceState,
                             modifier = Modifier.size(artworkSize).clip(artworkShape)
                         )
                     } else if (targetShowLyrics) {
-                        LyricView(lyrics, position, duration, onSeek, edgeToEdge = true)
+                        LyricView(lyrics, position, duration, onSeek, edgeToEdge = true, songArtwork = targetArtwork)
                     } else {
                         if (isDjMode) {
                             DjTurntable(
@@ -4489,13 +4000,330 @@ private fun groupBilingualLyrics(lyrics: List<Pair<Long, String>>): List<Bilingu
             )
         }
 
+/** 微信对话风格：一条歌词对应一条聊天气泡 */
+private data class ChatLyricMessage(
+    val timestamp: Long,
+    val text: String,
+    val subText: String?,
+    val onRight: Boolean
+)
+
+private fun buildChatLyricMessages(
+    lines: List<BilingualLyricLine>,
+    layout: String
+): List<ChatLyricMessage> {
+    val bilingual = layout == "bilingual"
+    val messages = ArrayList<ChatLyricMessage>(lines.size * 2)
+    lines.forEachIndexed { index, line ->
+        // 译文作为气泡主行，原文降为同一气泡内的次要一行
+        val primary = line.translation ?: line.original
+        val secondary = line.translation?.let { line.original }
+        if (bilingual) {
+            messages += ChatLyricMessage(line.timestamp, primary, null, false)
+            secondary?.let {
+                messages += ChatLyricMessage(line.timestamp, it, null, true)
+            }
+        } else {
+            messages += ChatLyricMessage(
+                timestamp = line.timestamp,
+                text = primary,
+                subText = secondary,
+                onRight = index % 2 == 1
+            )
+        }
+    }
+    return messages
+}
+
+private fun revealLyricProgress(text: String, progress: Float): String {
+    if (progress >= 1f || text.isEmpty()) return text
+    val total = text.codePointCount(0, text.length)
+    val shown = (total * progress).toInt().coerceIn(1, total)
+    return text.substring(0, text.offsetByCodePoints(0, shown))
+}
+
+@Composable
+private fun ChatLyricView(
+    lines: List<BilingualLyricLine>,
+    effectivePosition: Long,
+    duration: Long,
+    edgeToEdge: Boolean,
+    screenWidthDp: Int,
+    fontScale: Float,
+    animationsEnabled: Boolean,
+    animationSpeed: Float,
+    autoFollow: Boolean,
+    scrollEffect: String,
+    artwork: Bitmap?,
+    onSeek: (Long) -> Unit
+) {
+    val dark = isSystemInDarkTheme()
+    val showAvatars = LyricsDisplaySettings.chatAvatarsEnabled
+    val showTimestamps = LyricsDisplaySettings.chatTimestampsEnabled
+    val chatLayout = LyricsDisplaySettings.chatLayout
+    val messages = remember(lines, chatLayout) { buildChatLyricMessages(lines, chatLayout) }
+    // 聊天风格只回放已经唱到的歌词，下一句要等它的时间戳到达才出现
+    val visibleCount = (messages.indexOfLast { it.timestamp <= effectivePosition } + 1)
+        .coerceAtLeast(0)
+    val visibleMessages =
+        if (visibleCount >= messages.size) messages else messages.subList(0, visibleCount)
+    val currentMessageIndex = visibleMessages.lastIndex
+    val bubbleMaxWidth = (screenWidthDp * if (edgeToEdge) 0.60f else 0.66f).dp
+
+    val otherBubble = if (dark) Color(0xFF25262B) else Color.White
+    val otherText = if (dark) Color(0xFFE9EAEE) else Color(0xFF1B1B1F)
+    val selfBubble = if (dark) Color(0xFF2E5738) else Color(0xFF95EC69)
+    val selfText = if (dark) Color(0xFFD6F0D2) else Color(0xFF14260F)
+    val metaColor = if (dark) Color(0xFF8A8B90) else Color(0xFF9A9AA0)
+
+    if (visibleMessages.isEmpty()) {
+        Box(Modifier.fillMaxSize(), Alignment.Center) {
+            Text(
+                appText("歌词会像消息一样逐条出现", "Lyrics arrive one message at a time"),
+                style = MaterialTheme.typography.bodySmall,
+                color = metaColor
+            )
+        }
+        return
+    }
+
+    val listState = rememberLazyListState()
+    LaunchedEffect(
+        currentMessageIndex,
+        autoFollow,
+        scrollEffect,
+        edgeToEdge,
+        fontScale,
+        showTimestamps,
+        visibleMessages.size
+    ) {
+        if (!autoFollow || currentMessageIndex < 0) return@LaunchedEffect
+        withFrameNanos { }
+        if (listState.layoutInfo.visibleItemsInfo.none { it.index == currentMessageIndex }) {
+            listState.scrollToItem(currentMessageIndex)
+        }
+        val layoutInfo = snapshotFlow { listState.layoutInfo }.first { info ->
+            info.viewportEndOffset > info.viewportStartOffset &&
+                info.visibleItemsInfo.any { it.index == currentMessageIndex }
+        }
+        val currentItem = layoutInfo.visibleItemsInfo.first { it.index == currentMessageIndex }
+        val viewportHeight =
+            (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset).coerceAtLeast(1)
+        // 最新一条停在底部，像聊天记录一样向上堆积
+        val targetBottom =
+            layoutInfo.viewportEndOffset - viewportHeight * 0.06f
+        val delta = currentItem.offset + currentItem.size - targetBottom
+        if (scrollEffect == "instant") listState.scrollBy(delta) else listState.animateScrollBy(delta)
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = Modifier
+            .fillMaxHeight()
+            .then(
+                if (edgeToEdge) Modifier.requiredWidth(screenWidthDp.dp) else Modifier.fillMaxWidth()
+            ),
+        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 24.dp, bottom = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        itemsIndexed(visibleMessages) { index, message ->
+            val isCurrent = index == currentMessageIndex
+            val age = currentMessageIndex - index
+            // 当前气泡只放出已经唱到的字，其余历史气泡保持完整文本
+            val lineEnd = messages.getOrNull(index + 1)?.timestamp
+                ?: duration.takeIf { it > message.timestamp }
+                ?: (message.timestamp + 5_000L)
+            val lineProgress = if (isCurrent) {
+                ((effectivePosition - message.timestamp).toFloat() /
+                        (lineEnd - message.timestamp).coerceAtLeast(1L).toFloat())
+                    .coerceIn(0f, 1f)
+            } else {
+                1f
+            }
+            val transitionDuration =
+                if (animationsEnabled) (420 / animationSpeed).toInt().coerceAtLeast(120) else 0
+            val bubbleAlpha by animateFloatAsState(
+                targetValue = when {
+                    isCurrent -> 1f
+                    age <= 2 -> 0.88f
+                    age <= 5 -> 0.74f
+                    else -> 0.6f
+                },
+                animationSpec = tween(transitionDuration),
+                label = "chatBubbleAlpha"
+            )
+            Column(Modifier.fillMaxWidth()) {
+                val previous = visibleMessages.getOrNull(index - 1)
+                if (showTimestamps &&
+                    (previous == null || message.timestamp - previous.timestamp >= 20_000L)
+                ) {
+                    Text(
+                        text = formatTime(message.timestamp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = metaColor,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            onSeek(
+                                (message.timestamp - LyricsDisplaySettings.offsetMs.toLong())
+                                    .coerceAtLeast(0L)
+                            )
+                        },
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = if (message.onRight) Arrangement.End else Arrangement.Start
+                ) {
+                    if (showAvatars && !message.onRight) {
+                        ChatLyricAvatar(false, artwork, Modifier.padding(top = 2.dp))
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    ChatLyricBubble(
+                        text = revealLyricProgress(message.text, lineProgress),
+                        subText = message.subText?.let { revealLyricProgress(it, lineProgress) },
+                        onRight = message.onRight,
+                        bubbleColor = if (message.onRight) selfBubble else otherBubble,
+                        textColor = if (message.onRight) selfText else otherText,
+                        maxWidth = bubbleMaxWidth,
+                        fontScale = fontScale,
+                        modifier = Modifier.graphicsLayer { alpha = bubbleAlpha }
+                    )
+                    if (showAvatars && message.onRight) {
+                        Spacer(Modifier.width(6.dp))
+                        ChatLyricAvatar(true, artwork, Modifier.padding(top = 2.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatLyricBubble(
+    text: String,
+    subText: String?,
+    onRight: Boolean,
+    bubbleColor: Color,
+    textColor: Color,
+    maxWidth: androidx.compose.ui.unit.Dp,
+    fontScale: Float,
+    modifier: Modifier = Modifier
+) {
+    val bubbleShape = RoundedCornerShape(
+        topStart = if (onRight) 15.dp else 4.dp,
+        topEnd = if (onRight) 4.dp else 15.dp,
+        bottomEnd = 15.dp,
+        bottomStart = 15.dp
+    )
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = if (onRight) Arrangement.End else Arrangement.Start
+    ) {
+        if (!onRight) {
+            ChatLyricTail(false, bubbleColor, Modifier.padding(top = 9.dp).size(7.dp, 12.dp))
+        }
+        Column(
+            modifier = Modifier
+                .widthIn(max = maxWidth)
+                .clip(bubbleShape)
+                .background(bubbleColor)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    fontSize = (16.5f * fontScale).sp,
+                    lineHeight = (24f * fontScale).sp
+                ),
+                color = textColor
+            )
+            subText?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = (13.5f * fontScale).sp,
+                        lineHeight = (19f * fontScale).sp
+                    ),
+                    color = textColor.copy(alpha = 0.72f),
+                    modifier = Modifier.padding(top = 3.dp)
+                )
+            }
+        }
+        if (onRight) {
+            ChatLyricTail(true, bubbleColor, Modifier.padding(top = 9.dp).size(7.dp, 12.dp))
+        }
+    }
+}
+
+@Composable
+private fun ChatLyricTail(onRight: Boolean, color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val tailWidth = size.width
+        val tailHeight = size.height
+        val tail = Path().apply {
+            if (onRight) {
+                moveTo(0f, 0f)
+                lineTo(tailWidth, tailHeight * 0.42f)
+                lineTo(0f, tailHeight)
+            } else {
+                moveTo(tailWidth, 0f)
+                lineTo(0f, tailHeight * 0.42f)
+                lineTo(tailWidth, tailHeight)
+            }
+            close()
+        }
+        drawPath(tail, color)
+    }
+}
+
+@Composable
+private fun ChatLyricAvatar(
+    self: Boolean,
+    artwork: Bitmap?,
+    modifier: Modifier = Modifier
+) {
+    val avatarShape = RoundedCornerShape(5.dp)
+    Box(
+        modifier = modifier
+            .size(32.dp)
+            .clip(avatarShape)
+            .background(
+                if (self) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.surfaceVariant
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        if (artwork != null) {
+            androidx.compose.foundation.Image(
+                bitmap = artwork.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Icon(
+                imageVector = if (self) Icons.Default.Person else Icons.Default.MusicNote,
+                contentDescription = null,
+                tint = if (self) MaterialTheme.colorScheme.onPrimary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+    }
+}
+
 @Composable
 fun LyricView(
     lyrics: List<Pair<Long, String>>,
     currentPosition: Long,
     duration: Long,
     onSeek: (Long) -> Unit,
-    edgeToEdge: Boolean = false
+    edgeToEdge: Boolean = false,
+    songArtwork: Bitmap? = null
 ) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
@@ -4524,6 +4352,23 @@ fun LyricView(
     }
     val displayLyrics = remember(lyrics) { groupBilingualLyrics(lyrics) }
     val lineIdx = displayLyrics.indexOfLast { it.timestamp <= effectivePosition }
+    if (lyricStyle == "chat") {
+        ChatLyricView(
+            lines = displayLyrics,
+            effectivePosition = effectivePosition,
+            duration = duration,
+            edgeToEdge = edgeToEdge,
+            screenWidthDp = configuration.screenWidthDp,
+            fontScale = lyricFontScale,
+            animationsEnabled = lyricAnimations,
+            animationSpeed = animationSpeed,
+            autoFollow = autoFollow,
+            scrollEffect = lyricScrollEffect,
+            artwork = songArtwork,
+            onSeek = onSeek
+        )
+        return
+    }
     val listState = rememberLazyListState()
     LaunchedEffect(
         lineIdx,

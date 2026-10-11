@@ -2,6 +2,7 @@ package com.example.music
 
 import android.content.Context
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,10 +16,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BlurOn
+import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Animation
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -61,6 +65,9 @@ object LyricsDisplaySettings {
     var offsetMs by mutableFloatStateOf(0f)
     var currentColorArgb by mutableStateOf(0xFFFFFFFF.toInt())
     var inactiveColorArgb by mutableStateOf(0x99FFFFFF.toInt())
+    var chatLayout by mutableStateOf("alternate")
+    var chatAvatarsEnabled by mutableStateOf(true)
+    var chatTimestampsEnabled by mutableStateOf(true)
 
     fun load(context: Context) {
         val prefs = context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE)
@@ -77,6 +84,12 @@ object LyricsDisplaySettings {
         offsetMs = prefs.getFloat("lyrics_offset_ms", 0f).coerceIn(-5_000f, 5_000f)
         currentColorArgb = prefs.getInt("lyrics_current_color", 0xFFFFFFFF.toInt())
         inactiveColorArgb = prefs.getInt("lyrics_inactive_color", 0x99FFFFFF.toInt())
+        chatLayout = when (prefs.getString("lyrics_chat_layout", "alternate")) {
+            "bilingual" -> "bilingual"
+            else -> "alternate"
+        }
+        chatAvatarsEnabled = prefs.getBoolean("lyrics_chat_avatars", true)
+        chatTimestampsEnabled = prefs.getBoolean("lyrics_chat_timestamps", true)
     }
 
     fun setWordProgress(context: Context, enabled: Boolean) {
@@ -133,11 +146,15 @@ object LyricsDisplaySettings {
         inactiveColorArgb = value
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE).edit { putInt("lyrics_inactive_color", value) }
     }
+    fun setChatLayout(context: Context, value: String) = saveString(context, "lyrics_chat_layout", value) { chatLayout = it }
+    fun setChatAvatarsEnabled(context: Context, value: Boolean) = saveBoolean(context, "lyrics_chat_avatars", value) { chatAvatarsEnabled = it }
+    fun setChatTimestampsEnabled(context: Context, value: Boolean) = saveBoolean(context, "lyrics_chat_timestamps", value) { chatTimestampsEnabled = it }
     fun reset(context: Context) {
         context.getSharedPreferences("music_prefs", Context.MODE_PRIVATE).edit {
             remove("lyrics_alignment"); remove("lyrics_style"); remove("lyrics_direction"); remove("lyrics_scroll_effect"); remove("lyrics_animation_enabled")
             remove("lyrics_animation_speed"); remove("lyrics_auto_follow"); remove("lyrics_offset_ms")
             remove("lyrics_current_color"); remove("lyrics_inactive_color"); remove("lyrics_font_scale")
+            remove("lyrics_chat_layout"); remove("lyrics_chat_avatars"); remove("lyrics_chat_timestamps")
         }
         load(context)
     }
@@ -232,7 +249,7 @@ fun LyricsSettingsScreen(onBack: () -> Unit) {
                 onSelected = { LyricsDisplaySettings.setAlignment(context, it) }
             )
             ChoiceRow(
-                options = listOf("compact" to appText("紧凑", "Compact"), "melox" to "MeloX", "immersive" to appText("沉浸", "Immersive")),
+                options = listOf("compact" to appText("紧凑", "Compact"), "melox" to "MeloX", "immersive" to appText("沉浸", "Immersive"), "chat" to appText("微信对话", "Chat bubbles")),
                 selected = LyricsDisplaySettings.style,
                 onSelected = { LyricsDisplaySettings.setStyle(context, it) }
             )
@@ -246,6 +263,51 @@ fun LyricsSettingsScreen(onBack: () -> Unit) {
                 selected = LyricsDisplaySettings.scrollEffect,
                 onSelected = { LyricsDisplaySettings.setScrollEffect(context, it) }
             )
+
+            if (LyricsDisplaySettings.style == "chat") {
+                SettingsSectionHeader(appText("微信对话", "Chat bubbles"))
+                ListItem(
+                    headlineContent = { Text(appText("左右分配", "Bubble sides")) },
+                    supportingContent = { Text(appText("左右各一句歌词，逐行交替；或译文在左、原文在右", "Alternate one line per side, or translations left with originals right")) },
+                    leadingContent = { Icon(Icons.Default.Chat, null) }
+                )
+                ChoiceRow(
+                    options = listOf(
+                        "alternate" to appText("逐行交替", "Alternate"),
+                        "bilingual" to appText("译文/原文", "Translation / original")
+                    ),
+                    selected = LyricsDisplaySettings.chatLayout,
+                    onSelected = { LyricsDisplaySettings.setChatLayout(context, it) }
+                )
+                ListItem(
+                    headlineContent = { Text(appText("显示头像", "Show avatars")) },
+                    supportingContent = { Text(appText("对方气泡用专辑封面，本机气泡用默认头像", "Use album artwork for incoming bubbles and a default avatar for outgoing ones")) },
+                    leadingContent = { Icon(Icons.Default.Person, null) },
+                    trailingContent = {
+                        Switch(
+                            checked = LyricsDisplaySettings.chatAvatarsEnabled,
+                            onCheckedChange = { LyricsDisplaySettings.setChatAvatarsEnabled(context, it) }
+                        )
+                    },
+                    modifier = Modifier.clickable {
+                        LyricsDisplaySettings.setChatAvatarsEnabled(context, !LyricsDisplaySettings.chatAvatarsEnabled)
+                    }
+                )
+                ListItem(
+                    headlineContent = { Text(appText("显示时间戳", "Show timestamps")) },
+                    supportingContent = { Text(appText("两条歌词间隔超过 20 秒时插入时间分隔", "Insert a time separator when lines are more than 20 seconds apart")) },
+                    leadingContent = { Icon(Icons.Default.Schedule, null) },
+                    trailingContent = {
+                        Switch(
+                            checked = LyricsDisplaySettings.chatTimestampsEnabled,
+                            onCheckedChange = { LyricsDisplaySettings.setChatTimestampsEnabled(context, it) }
+                        )
+                    },
+                    modifier = Modifier.clickable {
+                        LyricsDisplaySettings.setChatTimestampsEnabled(context, !LyricsDisplaySettings.chatTimestampsEnabled)
+                    }
+                )
+            }
 
             SettingsSectionHeader(appText("颜色", "Colors"))
             ListItem(headlineContent = { Text(appText("当前歌词", "Current lyric")) })
@@ -306,7 +368,13 @@ fun LyricsSettingsScreen(onBack: () -> Unit) {
 
 @Composable
 private fun ChoiceRow(options: List<Pair<String, String>>, selected: String, onSelected: (String) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
         options.forEach { (value, label) ->
             FilterChip(selected = selected == value, onClick = { onSelected(value) }, label = { Text(label) })
         }
