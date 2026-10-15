@@ -11,6 +11,7 @@ sealed class Screen {
     data object LyricsSettings : Screen()
     data object AudioCodecs : Screen()
     data object AboutSupport : Screen()
+    data object OpenSourceLibraries : Screen()
     data object LocalMusic : Screen()
     data object PlayerView : Screen()
 
@@ -19,6 +20,6 @@ sealed class Screen {
         PlayerView -> LocalMusic
         Settings -> LocalMusic
         Library, Data, Playback, AudioOutput, Personalization, LyricsAndDevices, LyricsSettings, AudioCodecs,
-        AboutSupport -> Settings
+        AboutSupport, OpenSourceLibraries -> Settings
     }
 }

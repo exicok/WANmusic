@@ -1379,6 +1379,10 @@ fun MusicApp(
                             onBack = handleBack
                         )
                         Screen.AboutSupport -> AboutSupportScreen(
+                            onBack = handleBack,
+                            onNavigate = { currentScreen = it }
+                        )
+                        Screen.OpenSourceLibraries -> OpenSourceLibrariesScreen(
                             onBack = handleBack
                         )
                     }

@@ -11,9 +11,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.LibraryBooks
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.NewReleases
@@ -35,7 +37,7 @@ import androidx.compose.ui.unit.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AboutSupportScreen(onBack: () -> Unit) {
+fun AboutSupportScreen(onBack: () -> Unit, onNavigate: (Screen) -> Unit) {
     val context = LocalContext.current
     val dockContentPadding = LocalDockContentPadding.current
     val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
@@ -133,6 +135,15 @@ fun AboutSupportScreen(onBack: () -> Unit) {
                 )
             }
             item { HorizontalDivider(Modifier.padding(top = 4.dp)) }
+            item {
+                ListItem(
+                    headlineContent = { Text("引用库") },
+                    supportingContent = { Text("查看本应用引用的开源库、版本与许可信息") },
+                    leadingContent = { Icon(Icons.Default.LibraryBooks, null) },
+                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                    modifier = Modifier.clickable { onNavigate(Screen.OpenSourceLibraries) }
+                )
+            }
             item {
                 ListItem(
                     headlineContent = { Text("应用信息") },
