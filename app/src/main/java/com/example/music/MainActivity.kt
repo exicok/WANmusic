@@ -25,6 +25,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Spring
@@ -77,6 +79,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -133,6 +136,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.collect
@@ -3009,6 +3013,63 @@ private fun ConfigurableAlbumArtwork(
     }
 }
 
+/**
+ * 播放页大图/小图专辑封面的槽位位置（窗口根坐标系，px），用于切换歌词时的封面飞行动画。
+ */
+private class ArtworkSlotPositions {
+    var rootX by mutableFloatStateOf(0f)
+    var rootY by mutableFloatStateOf(0f)
+    var bigX by mutableFloatStateOf(Float.NaN)
+    var bigY by mutableFloatStateOf(Float.NaN)
+    var smallX by mutableFloatStateOf(Float.NaN)
+    var smallY by mutableFloatStateOf(Float.NaN)
+}
+
+/**
+ * 在两个槽位之间飞行的专辑封面：progress 0 = 大图槽位，1 = 小图槽位。
+ * 位置、尺寸、圆角与鼓点缩放在两端都与内联封面一致，交接时不会跳变。
+ */
+@Composable
+private fun FlyingAlbumArtwork(
+    bitmap: Bitmap,
+    positions: ArtworkSlotPositions,
+    bigSizePx: Float,
+    smallSizePx: Float,
+    progress: Animatable<Float, AnimationVector1D>,
+    beatScale: () -> Float,
+    bigCornerDp: Float,
+    smallCornerDp: Float,
+    onClick: () -> Unit
+) {
+    if (positions.bigX.isNaN() || positions.bigY.isNaN() ||
+        positions.smallX.isNaN() || positions.smallY.isNaN()
+    ) return
+    val fraction = progress.value
+    val left = (positions.bigX + (positions.smallX - positions.bigX) * fraction) - positions.rootX
+    val top = (positions.bigY + (positions.smallY - positions.bigY) * fraction) - positions.rootY
+    val size = bigSizePx + (smallSizePx - bigSizePx) * fraction
+    if (size < 1f) return
+    val beat = beatScale()
+    val scale = beat + ((1f + (beat - 1f) * 0.7f) - beat) * fraction
+    val corner = (bigCornerDp + (smallCornerDp - bigCornerDp) * fraction).dp
+    with(LocalDensity.current) {
+        androidx.compose.foundation.Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = Modifier
+                .offset(x = left.toDp(), y = top.toDp())
+                .size(size.toDp())
+                .clip(RoundedCornerShape(corner))
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
+                .clickable(onClick = onClick),
+            contentScale = ContentScale.Crop
+        )
+    }
+}
+
 /** 音频格式信息：采样率 / 比特率 / 编码 / 容器 */
 data class AudioFormatInfo(
     val sampleRateHz: Int,   // 例如 44100
@@ -3342,6 +3403,37 @@ fun FullPlayerScreen(
         animationSpec = tween(durationMillis = if (animationsEnabled) 100 else 0),
         label = "ArtworkBeatScale"
     )
+    // 切换歌词时封面在大图/小图槽位之间滑行，仅竖屏普通封面模式启用
+    val artworkPositions = remember { ArtworkSlotPositions() }
+    val heroProgress = remember { Animatable(0f) }
+    var heroFlying by remember { mutableStateOf(false) }
+    val heroEnabled = !isLandscape && !isDjMode && !AlbumDotMatrixSettings.enabled &&
+        playerArtwork != null && animationsEnabled &&
+        !(mvModeEnabled && song.videoUri != null && mvVideoPlayer != null)
+    // 接管标记必须与 showLyrics 同帧写入：否则切换的那一帧内联封面会先按新布局画出再被飞行层顶掉
+    val toggleLyrics: (Boolean) -> Unit = { toLyrics ->
+        if (toLyrics != showLyrics && heroEnabled) heroFlying = true
+        showLyrics = toLyrics
+    }
+    LaunchedEffect(showLyrics) {
+        val target = if (showLyrics) 1f else 0f
+        if (!heroEnabled) {
+            heroFlying = false
+            heroProgress.snapTo(target)
+            return@LaunchedEffect
+        }
+        if (!heroFlying && target == heroProgress.value) return@LaunchedEffect
+        // 未经点击发起的切换（如 MV 强制退出歌词）从对侧静止位置起飞
+        if (!heroFlying) heroProgress.snapTo(1f - target)
+        heroFlying = true
+        // 目标槽位要等切换后的布局完成才测得到，先等到有效位置再插值
+        withTimeoutOrNull(200L) {
+            snapshotFlow { if (showLyrics) artworkPositions.smallX else artworkPositions.bigX }
+                .first { !it.isNaN() }
+        }
+        heroProgress.animateTo(target, tween(420))
+        heroFlying = false
+    }
     // 按需加载音频格式信息（采样率/比特率），不阻塞主线程
     val audioFormat = remember(song.uri) {
         mutableStateOf<AudioFormatInfo?>(null)
@@ -3360,6 +3452,11 @@ fun FullPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surface)
+            .onGloballyPositioned { coords ->
+                val origin = coords.localToRoot(Offset.Zero)
+                artworkPositions.rootX = origin.x
+                artworkPositions.rootY = origin.y
+            }
     ) {
         // 背景层随歌曲封面交叉渐变，避免切歌时瞬间跳变。
         AnimatedContent(
@@ -3565,8 +3662,11 @@ fun FullPlayerScreen(
                         if (!animationsEnabled) {
                             EnterTransition.None togetherWith ExitTransition.None
                         } else if (initialState.first != targetState.first) {
-                            (fadeIn(animationSpec = tween(400)) + scaleIn(initialScale = 0.92f)) togetherWith
-                                fadeOut(animationSpec = tween(400))
+                            // 飞行接管时入场内容不能带缩放：槽位按根坐标系测量，缩放会让落点漂移
+                            val artworkEnter =
+                                if (heroEnabled) fadeIn(animationSpec = tween(400))
+                                else fadeIn(animationSpec = tween(400)) + scaleIn(initialScale = 0.92f)
+                            artworkEnter togetherWith fadeOut(animationSpec = tween(400))
                         } else {
                             val initialIndex = songs.indexOfFirst { it.uri == initialState.second }
                             val targetIndex = songs.indexOfFirst { it.uri == targetState.second }
@@ -3615,10 +3715,16 @@ fun FullPlayerScreen(
                                         .clip(artworkShape)
                                 })
                                     .graphicsLayer {
+                                        alpha = if (heroFlying) 0f else 1f
                                         scaleX = beatScale
                                         scaleY = beatScale
                                     }
-                                    .clickable { showLyrics = true },
+                                    .clickable { toggleLyrics(true) }
+                                    .onGloballyPositioned { coords ->
+                                        val slot = coords.localToRoot(Offset.Zero)
+                                        artworkPositions.bigX = slot.x
+                                        artworkPositions.bigY = slot.y
+                                    },
                             )
                         } else {
                             Surface(
@@ -3648,12 +3754,18 @@ fun FullPlayerScreen(
                             Modifier
                                 .size(56.dp)
                                 .graphicsLayer {
+                                    alpha = if (heroFlying) 0f else 1f
                                     val s = 1f + (beatScale - 1f) * 0.7f
                                     scaleX = s
                                     scaleY = s
                                 }
                                 .clip(RoundedCornerShape(8.dp))
-                                .clickable { showLyrics = false },
+                                .clickable { toggleLyrics(false) }
+                                .onGloballyPositioned { coords ->
+                                    val slot = coords.localToRoot(Offset.Zero)
+                                    artworkPositions.smallX = slot.x
+                                    artworkPositions.smallY = slot.y
+                                },
                             contentScale = ContentScale.Crop
                         )
                     } else {
@@ -3811,6 +3923,21 @@ fun FullPlayerScreen(
                 onRepeatModeChange = onRepeatModeChange,
                 shuffleMode = shuffleMode,
                 onShuffleModeChange = onShuffleModeChange
+            )
+        }
+        // 飞行中的封面绘制在最上层，落点与内联封面重合后再交还给内联显示
+        if (heroFlying && playerArtwork != null) {
+            val density = LocalDensity.current
+            FlyingAlbumArtwork(
+                bitmap = playerArtwork,
+                positions = artworkPositions,
+                bigSizePx = with(density) { artworkSize.toPx() },
+                smallSizePx = with(density) { 56.dp.toPx() },
+                progress = heroProgress,
+                beatScale = { beatScale },
+                bigCornerDp = 32f,
+                smallCornerDp = 8f,
+                onClick = { toggleLyrics(!showLyrics) }
             )
         }
         }
@@ -4074,10 +4201,10 @@ private fun ChatLyricView(
     val currentMessageIndex = visibleMessages.lastIndex
     val bubbleMaxWidth = (screenWidthDp * if (edgeToEdge) 0.60f else 0.66f).dp
 
-    val otherBubble = if (dark) Color(0xFF25262B) else Color.White
+    val otherBubble = if (dark) Color(0xFF2C2C2C) else Color.White
     val otherText = if (dark) Color(0xFFE9EAEE) else Color(0xFF1B1B1F)
-    val selfBubble = if (dark) Color(0xFF2E5738) else Color(0xFF95EC69)
-    val selfText = if (dark) Color(0xFFD6F0D2) else Color(0xFF14260F)
+    val selfBubble = Color(0xFF07C160)
+    val selfText = Color.White
     val metaColor = if (dark) Color(0xFF8A8B90) else Color(0xFF9A9AA0)
 
     if (visibleMessages.isEmpty()) {
